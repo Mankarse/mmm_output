@@ -8,6 +8,15 @@
 
 /* Begin PBXBuildFile section */
 		208CF22C1A343D98007AA014 /* main.c in Sources */ = {isa = PBXBuildFile; fileRef = 208CF22B1A343D98007AA014 /* main.c */; };
+		208CF2351A343FF4007AA014 /* libogg.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 208CF2341A343FF4007AA014 /* libogg.a */; };
+		208CF2371A34402B007AA014 /* libSDL2.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 208CF2361A34402B007AA014 /* libSDL2.a */; };
+		208CF2391A34403B007AA014 /* libsndfile.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 208CF2381A34403B007AA014 /* libsndfile.a */; };
+		208CF23D1A34405B007AA014 /* libvorbis.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 208CF23A1A34405B007AA014 /* libvorbis.a */; };
+		208CF23E1A34405B007AA014 /* libvorbisenc.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 208CF23B1A34405B007AA014 /* libvorbisenc.a */; };
+		208CF23F1A34405B007AA014 /* libvorbisfile.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 208CF23C1A34405B007AA014 /* libvorbisfile.a */; };
+		20D08F091A76F88F00E0DBD2 /* new_main.c in Sources */ = {isa = PBXBuildFile; fileRef = 20D08F081A76F88F00E0DBD2 /* new_main.c */; };
+		20D08F0C1A76F8F900E0DBD2 /* playlist_player.c in Sources */ = {isa = PBXBuildFile; fileRef = 20D08F0A1A76F8F900E0DBD2 /* playlist_player.c */; };
+		20F0E9A11A7788A600BD1768 /* libuv.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 20F0E9A01A7788A600BD1768 /* libuv.a */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -25,6 +34,16 @@
 /* Begin PBXFileReference section */
 		208CF2281A343D98007AA014 /* mmm_output */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = mmm_output; sourceTree = BUILT_PRODUCTS_DIR; };
 		208CF22B1A343D98007AA014 /* main.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = main.c; sourceTree = "<group>"; };
+		208CF2341A343FF4007AA014 /* libogg.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libogg.a; path = ../../ExternalLibraries/ogg/library/lib/libogg.a; sourceTree = "<group>"; };
+		208CF2361A34402B007AA014 /* libSDL2.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libSDL2.a; path = ../../ExternalLibraries/SDL2/library/lib/libSDL2.a; sourceTree = "<group>"; };
+		208CF2381A34403B007AA014 /* libsndfile.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libsndfile.a; path = ../../ExternalLibraries/sndfile/library/lib/libsndfile.a; sourceTree = "<group>"; };
+		208CF23A1A34405B007AA014 /* libvorbis.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libvorbis.a; path = ../../ExternalLibraries/vorbis/library/lib/libvorbis.a; sourceTree = "<group>"; };
+		208CF23B1A34405B007AA014 /* libvorbisenc.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libvorbisenc.a; path = ../../ExternalLibraries/vorbis/library/lib/libvorbisenc.a; sourceTree = "<group>"; };
+		208CF23C1A34405B007AA014 /* libvorbisfile.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libvorbisfile.a; path = ../../ExternalLibraries/vorbis/library/lib/libvorbisfile.a; sourceTree = "<group>"; };
+		20D08F081A76F88F00E0DBD2 /* new_main.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = new_main.c; sourceTree = "<group>"; };
+		20D08F0A1A76F8F900E0DBD2 /* playlist_player.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = playlist_player.c; sourceTree = "<group>"; };
+		20D08F0B1A76F8F900E0DBD2 /* playlist_player.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = playlist_player.h; sourceTree = "<group>"; };
+		20F0E9A01A7788A600BD1768 /* libuv.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libuv.a; path = "../../Downloads/libuv-v1.2.1/build/Release/libuv.a"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -32,6 +51,13 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				208CF23D1A34405B007AA014 /* libvorbis.a in Frameworks */,
+				208CF23E1A34405B007AA014 /* libvorbisenc.a in Frameworks */,
+				208CF23F1A34405B007AA014 /* libvorbisfile.a in Frameworks */,
+				208CF2391A34403B007AA014 /* libsndfile.a in Frameworks */,
+				20F0E9A11A7788A600BD1768 /* libuv.a in Frameworks */,
+				208CF2371A34402B007AA014 /* libSDL2.a in Frameworks */,
+				208CF2351A343FF4007AA014 /* libogg.a in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -41,6 +67,13 @@
 		208CF21F1A343D98007AA014 = {
 			isa = PBXGroup;
 			children = (
+				20F0E9A01A7788A600BD1768 /* libuv.a */,
+				208CF23A1A34405B007AA014 /* libvorbis.a */,
+				208CF23B1A34405B007AA014 /* libvorbisenc.a */,
+				208CF23C1A34405B007AA014 /* libvorbisfile.a */,
+				208CF2381A34403B007AA014 /* libsndfile.a */,
+				208CF2361A34402B007AA014 /* libSDL2.a */,
+				208CF2341A343FF4007AA014 /* libogg.a */,
 				208CF22A1A343D98007AA014 /* mmm_output */,
 				208CF2291A343D98007AA014 /* Products */,
 			);
@@ -58,6 +91,9 @@
 			isa = PBXGroup;
 			children = (
 				208CF22B1A343D98007AA014 /* main.c */,
+				20D08F081A76F88F00E0DBD2 /* new_main.c */,
+				20D08F0B1A76F8F900E0DBD2 /* playlist_player.h */,
+				20D08F0A1A76F8F900E0DBD2 /* playlist_player.c */,
 			);
 			path = mmm_output;
 			sourceTree = "<group>";
@@ -119,6 +155,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				208CF22C1A343D98007AA014 /* main.c in Sources */,
+				20D08F0C1A76F8F900E0DBD2 /* playlist_player.c in Sources */,
+				20D08F091A76F88F00E0DBD2 /* new_main.c in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -133,6 +171,7 @@
 				CLANG_CXX_LIBRARY = "libc++";
 				CLANG_ENABLE_MODULES = YES;
 				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_STATIC_ANALYZER_MODE = deep;
 				CLANG_WARN_BOOL_CONVERSION = YES;
 				CLANG_WARN_CONSTANT_CONVERSION = YES;
 				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
@@ -144,7 +183,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
-				GCC_C_LANGUAGE_STANDARD = gnu99;
+				GCC_C_LANGUAGE_STANDARD = c99;
 				GCC_DYNAMIC_NO_PIC = NO;
 				GCC_OPTIMIZATION_LEVEL = 0;
 				GCC_PREPROCESSOR_DEFINITIONS = (
@@ -158,10 +197,28 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include,
+					/Users/evan/ExternalLibraries/ogg/library/include,
+					/Users/evan/ExternalLibraries/vorbis/library/include,
+					/Users/evan/ExternalLibraries/flac/library/include,
+					/Users/evan/ExternalLibraries/sndfile/library/include,
+					/Users/evan/ExternalLibraries/SDL2/library/include,
+				);
+				LIBRARY_SEARCH_PATHS = (
+					/Users/evan/ExternalLibraries/ogg/library/lib,
+					/Users/evan/ExternalLibraries/vorbis/library/lib,
+					/Users/evan/ExternalLibraries/flac/library/lib,
+					/Users/evan/ExternalLibraries/sndfile/library/lib,
+					/Users/evan/ExternalLibraries/SDL2/library/lib,
+				);
 				MACOSX_DEPLOYMENT_TARGET = 10.10;
 				MTL_ENABLE_DEBUG_INFO = YES;
 				ONLY_ACTIVE_ARCH = YES;
+				RUN_CLANG_STATIC_ANALYZER = YES;
 				SDKROOT = macosx;
+				WARNING_CFLAGS = "-Weverything";
 			};
 			name = Debug;
 		};
@@ -173,6 +230,7 @@
 				CLANG_CXX_LIBRARY = "libc++";
 				CLANG_ENABLE_MODULES = YES;
 				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_STATIC_ANALYZER_MODE = deep;
 				CLANG_WARN_BOOL_CONVERSION = YES;
 				CLANG_WARN_CONSTANT_CONVERSION = YES;
 				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
@@ -186,22 +244,58 @@
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
-				GCC_C_LANGUAGE_STANDARD = gnu99;
+				GCC_C_LANGUAGE_STANDARD = c99;
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
 				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
 				GCC_WARN_UNDECLARED_SELECTOR = YES;
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include,
+					/Users/evan/ExternalLibraries/ogg/library/include,
+					/Users/evan/ExternalLibraries/vorbis/library/include,
+					/Users/evan/ExternalLibraries/flac/library/include,
+					/Users/evan/ExternalLibraries/sndfile/library/include,
+					/Users/evan/ExternalLibraries/SDL2/library/include,
+				);
+				LIBRARY_SEARCH_PATHS = (
+					/Users/evan/ExternalLibraries/ogg/library/lib,
+					/Users/evan/ExternalLibraries/vorbis/library/lib,
+					/Users/evan/ExternalLibraries/flac/library/lib,
+					/Users/evan/ExternalLibraries/sndfile/library/lib,
+					/Users/evan/ExternalLibraries/SDL2/library/lib,
+				);
 				MACOSX_DEPLOYMENT_TARGET = 10.10;
 				MTL_ENABLE_DEBUG_INFO = NO;
+				RUN_CLANG_STATIC_ANALYZER = YES;
 				SDKROOT = macosx;
+				WARNING_CFLAGS = "-Weverything";
 			};
 			name = Release;
 		};
 		208CF2301A343D98007AA014 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include,
+					/Users/evan/ExternalLibraries/ogg/library/include,
+					/Users/evan/ExternalLibraries/vorbis/library/include,
+					/Users/evan/ExternalLibraries/flac/library/include,
+					/Users/evan/ExternalLibraries/sndfile/library/include,
+					/Users/evan/ExternalLibraries/SDL2/library/include,
+					"/Users/evan/Downloads/libuv-v1.2.1/include",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					/Users/evan/ExternalLibraries/ogg/library/lib,
+					/Users/evan/ExternalLibraries/SDL2/library/lib,
+					/Users/evan/ExternalLibraries/sndfile/library/lib,
+					/Users/evan/ExternalLibraries/vorbis/library/lib,
+					"/Users/evan/Downloads/libuv-v1.2.1/build/Release",
+				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 			};
 			name = Debug;
@@ -209,6 +303,24 @@
 		208CF2311A343D98007AA014 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include,
+					/Users/evan/ExternalLibraries/ogg/library/include,
+					/Users/evan/ExternalLibraries/vorbis/library/include,
+					/Users/evan/ExternalLibraries/flac/library/include,
+					/Users/evan/ExternalLibraries/sndfile/library/include,
+					/Users/evan/ExternalLibraries/SDL2/library/include,
+					"/Users/evan/Downloads/libuv-v1.2.1/include",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					/Users/evan/ExternalLibraries/ogg/library/lib,
+					/Users/evan/ExternalLibraries/SDL2/library/lib,
+					/Users/evan/ExternalLibraries/sndfile/library/lib,
+					/Users/evan/ExternalLibraries/vorbis/library/lib,
+					"/Users/evan/Downloads/libuv-v1.2.1/build/Release",
+				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 			};
 			name = Release;
@@ -232,6 +344,7 @@
 				208CF2311A343D98007AA014 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
 	};

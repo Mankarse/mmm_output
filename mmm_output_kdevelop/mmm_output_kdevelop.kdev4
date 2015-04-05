@@ -1,0 +1,4 @@
+[Project]
+Name=mmm_output_kdevelop
+Manager=KDevCMakeManager
+VersionControl=
