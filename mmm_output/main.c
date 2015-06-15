@@ -1,4 +1,10 @@
 #if 1
+//
+#include "main.h"
+#include "command_parser.h"
+
+#include <alsa/asoundlib.h>
+#include <sndfile.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,9 +12,44 @@
 #include <sched.h>
 #include <errno.h>
 #include <getopt.h>
-#include <alsa/asoundlib.h>
-#include <sys/time.h>
+
 #include <math.h>
+#include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sched.h>
+#include <errno.h>
+#include <getopt.h>
+#include <math.h>
+#include <sys/time.h>
+
+#include <limits.h>
+#include <string.h>
+
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+#include <stdio.h>
+#include <math.h>
+
+#include <stdbool.h>
+
+#include <systemd/sd-daemon.h>
+
+int inputfd = -1;
+int outputfd = -1;
+/*
+static FILE *input_source = 0;//stdin
+static FILE *output_sink = 0;//stdout
+static FILE *error_sink = 0;//stderr
+static FILE *log_sink = 0;//log file
+*/
+//Number that is printed and incremented on each write to error_sink or log_sink;
+//Used to determine when lines in each file were printed relative to each other.
+//static unsigned long long output_count = 0;
+
+
 static char *device = "default";         /* playback device */
 static snd_pcm_format_t format = SND_PCM_FORMAT_S16;    /* sample format */
 static unsigned int rate = 44100;           /* stream rate */
@@ -22,6 +63,11 @@ static snd_pcm_sframes_t buffer_size;
 static snd_pcm_sframes_t period_size;
 static snd_output_t *output = NULL;
 
+//Need a strategy for handling errors:
+// Which errors to attempt to recover from?
+// At what level?
+// How to report errors?
+// How to consistently manage errors in callbacks?
 
 //Code with very high correctness requirements (e.g. avionics) generally follows these rules:
 // No Recursion
@@ -42,43 +88,22 @@ static snd_output_t *output = NULL;
 // Seek
 // GetState
 // Gap-free track transitions.
-// Delays (and other effects?)
+// Delays (and volume and other effects?)
 // Multiple outputs (file/stream/test/DAC) (switched on per-track basis or global basis? (or both))
+//  Synchronisation of multiple outputs.
+//  Perhaps as another part of the system, a 'broadcaster' concept,
+//   so there can be multiple players over the same database.
+//  (A player can subscribe to a broadcaster. Each broadcaster has an independent playlist.
+//    For example, one player could use the sound output of the browser,
+//    while another uses the USB output on the music server. If each were subscribed to a different broadcaster they would play different things.
+//   If there is a 'broadcaster' concept, perhaps each player would only need one output (but having multiple outputs from one player
+//   simplifies synchronisation perhaps))
 // Multiple data formats (requires starting/stopping output devices dynamically.)
 // Direct Stream Digital support (requires some sort of rethinking of how we treat samples)
-#include <poll.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sched.h>
-#include <errno.h>
-#include <getopt.h>
-//#include "../include/asoundlib.h"
-//#include <sys/time.h>
-#include <math.h>
+// Sequencer, support for rendering of MIDI (and similar formats)
 
 
-#include <alsa/asoundlib.h>
-#include  <sndfile.h>
-
-#include <stdio.h>
-#include <string.h>
-//#include <ao/ao.h>
-#include <math.h>
-#include <limits.h>
-#include <string.h>
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <assert.h>
-
-#include <stdbool.h>
-
-//#define SDL_MAIN_HANDLED
-//#include "SDL2/SDL.h"
-//#include "SDL2/SDL_audio.h"
-//TODO: dynamic number of channels, rather than hardcoding 2
+//TODO: dynamic number of channels, rather than hardcoding 2;
 //      will require changes to the rest of the code.
 //      In particular, a significant restructuring would
 //      allow for dynamic output formats (channels, sample rate).
@@ -89,36 +114,7 @@ static snd_output_t *output = NULL;
 //      the hardware/input combination allows, and to allow playing of non-hardware supported
 //      formats through resampling.
 #define NUM_CHANNELS 2
-typedef enum {
-	UpdatePlaylist,     //TODO
-	ReplacePlaylist,
-	//Seek,            //TODO
-	Pause,
-	Resume,
-	//GetCurrentState, //TODO
-	Halt, //TODO
-} CommandType;
 
-
-typedef struct {
-	char *url;
-	//
-} Track;
-
-typedef struct {
-	char *guid_str;
-} GUID;
-
-typedef struct {
-	GUID guid;
-	Track track;
-} TrackPlayIdentifier;
-
-typedef struct TrackPlayIdentifierNode_ {
-	struct TrackPlayIdentifierNode_ *prev;
-	struct TrackPlayIdentifierNode_ *next;
-	TrackPlayIdentifier track;
-} TrackPlayIdentifierNode;
 void destroy_GUID(GUID *guid) {
 	free(guid->guid_str);
 }
@@ -146,29 +142,9 @@ void delete_forwards_TrackPlayIdentifierNode(TrackPlayIdentifierNode *track) {
 		track = next_track;
 	}
 }
-typedef struct {
-	bool dirty;
-	TrackPlayIdentifierNode *front;
-	TrackPlayIdentifierNode *back;
-	//unsigned int start_index;
-	//unsigned int end_index;
-} Playlist;
 
-typedef struct {
-	bool done;
-} DoneFlag;
 
-typedef struct Command_ {
-	struct Command_ *prev;
-	struct Command_ *next;
-	CommandType type;
-	union {
-		Playlist new_playlist;
-		DoneFlag done;
-	} data;
-} Command;
-
-void free_command(Command *command) {
+void free_command(struct Command *command) {
 	if (command) {
 		switch (command->type) {
 			case UpdatePlaylist:
@@ -186,11 +162,11 @@ void free_command(Command *command) {
 }
 
 typedef struct {
-	Command *front;
-	Command *back;
+	struct Command *front;
+	struct Command *back;
 } CommandQueue;
 
-int queue_command(CommandQueue *commandQueue, Command* command) {
+int queue_command(CommandQueue *commandQueue, struct Command* command) {
 	//Adds `command` to the front of the queue;
 	if (!commandQueue->front) {
 		commandQueue->front = command;
@@ -208,15 +184,15 @@ int queue_command(CommandQueue *commandQueue, Command* command) {
 	return 0;
 }
 
-Command *dequeue_command(CommandQueue *commandQueue) {
+struct Command *dequeue_command(CommandQueue *commandQueue) {
 	//Removes the the command from the end of the queue
 	//and returns it.
 	//Returns NULL on the queue being empty;
 	//printf("Trying command dequeue\n");
-	Command *command = commandQueue->back;
+	struct Command *command = commandQueue->back;
 	if (!command) goto end;
 
-	printf("Doing command dequeue\n");
+	//printf("Doing command dequeue\n");
 	commandQueue->back = commandQueue->back->prev;
 
 	if (commandQueue->back == 0) {
@@ -290,18 +266,14 @@ typedef struct {
 	//Playlist *playlist;
 	//FileCacheList *cachelist;
 } PauseResumeManager;
-
+enum PlayerStatePhase {
+	PLAYING, //Currently playing something.
+	PAUSING, //Currently looking for break in track (to stop current track).
+	RESUMING,//Currently looking for break in track (to resume current track).
+	SILENCE  //Currently playing nothing.
+};
 typedef struct {
-	enum {
-		PLAYING,
-		PAUSING,
-		RESUMING,
-		SILENCE
-	} phase;
-	//enum {
-	//    WANT_SILENCE,
-	//    WANT_NEXT_TRACK
-	//} pause_reason;
+	enum PlayerStatePhase phase;
 	bool want_silence;  //True if the system is in the state where it doesn't want to play anything (paused)
 	                    //False if the system is in the state where it wants to play every track in its buffer (resumed)
 
@@ -397,8 +369,6 @@ bool TrackPlayIdentifier_compatible_with(TrackPlayIdentifier const *l, TrackPlay
 void destroy_FileCache(FileCache *cache) {
 	sf_close(cache->file);
 }
-
-
 
 void destroy_TrackPlayState(TrackPlayState *state) {
 	if (state->track) {
@@ -509,7 +479,7 @@ bool all(bool *arr, size_t const len) {
 
 //TODO some way of signalling an error in do_pause.
 size_t PauseResumeManager_do_pause(
-    PauseResumeManager *pauser, size_t pos, short (* const out)[NUM_CHANNELS], size_t const out_len, bool * const pause_finished)
+    PauseResumeManager *pauser, size_t pos, short (*const out)[NUM_CHANNELS], size_t const out_len, bool *const pause_finished)
 {
 	//Current algorithm:
 	// for each channel
@@ -675,7 +645,7 @@ void PlaylistPlayer_get_frames(PlaylistPlayer *player, unsigned char *const stre
 	size_t buf_len = len/sizeof (short[NUM_CHANNELS]);
 
 	if (player->playlist.front) {
-
+		
 	}
 
 	//TODO -- move this logic somewhere else, so it does not need
@@ -1017,8 +987,6 @@ void PlaylistPlayer_resume(PlaylistPlayer *player) {
 	}
 }
 
-
-
 void delete_forwards_FileCacheNode(FileCacheNode *file) {
 	while (file) {
 		FileCacheNode *next_file = file->next;
@@ -1217,7 +1185,7 @@ enum AudioState {
 struct AudioCallbackData {
 	CommandQueue commandQueue;
 	PlaylistPlayer player;
-	Command *halt_command;
+	struct Command *halt_command;
 };
 #if 0
 //Returns the first frame in buf
@@ -1277,32 +1245,37 @@ static void AudioCallback(void *const userdata,
 {
 	//printf("StreamLen: %zu, %d\n", len/(sizeof(int[NUM_CHANNELS])), rand());
 	struct AudioCallbackData *const ud = userdata;
-	Command *command;
+	struct Command *command;
 	while (!ud->halt_command && (command = dequeue_command(&ud->commandQueue))) {
-		//printf("Dequeued Command\n");
+		printf("Dequeued Command\n");
 		switch(command->type){
-		case UpdatePlaylist:
-			fprintf(stderr, "Updating Playlist\n");
+		case UpdatePlaylist:{
+			char const outstr[] = "Updating Playlist\n";
+			write(outputfd, outstr, sizeof outstr -1);
 			PlaylistPlayer_update_playlist(&ud->player, &command->data.new_playlist, command->type);
-		break;
-		case ReplacePlaylist:
-			fprintf(stderr, "Replacing Playlist\n");
+		}break;
+		case ReplacePlaylist:{
+			char const outstr[] = "Replacing Playlist\n";
+			write(outputfd, outstr, sizeof outstr -1);
 			PlaylistPlayer_update_playlist(&ud->player, &command->data.new_playlist, command->type);
-		break;
-		case Pause:
-			fprintf(stderr, "Pausing\n");
+		}break;
+		case Pause:{
+			char const outstr[] = "Pausing\n";
+			write(outputfd, outstr, sizeof outstr -1);
 			PlaylistPlayer_pause(&ud->player);
-		break;
-		case Resume:
-			fprintf(stderr, "Resuming\n");
+		}break;
+		case Resume:{
+			char const outstr[] = "Resuming\n";
+			write(outputfd, outstr, sizeof outstr -1);
 			PlaylistPlayer_resume(&ud->player);
-		break;
-		case Halt:
-			fprintf(stderr, "Halting\n");
+		}break;
+		case Halt:{
+			char const outstr[] = "Halting\n";
+			write(outputfd, outstr, sizeof outstr -1);
 			ud->halt_command = command;
 			command = 0;
 			PlaylistPlayer_pause(&ud->player);
-		break;
+		}break;
 		//case SeekTrack:
 		//break;
 		//case CetCurrentState:
@@ -1389,166 +1362,6 @@ static void AudioCallback(void *const userdata,
 //  UpdateQueuedData(deviceid, StartPoint, Callback(QueueData))
 
 
-
-
-bool consume_space(char const * const str, size_t *pos, size_t const len) {
-	if (*pos >= len || str[*pos] != ' ') {
-		return false;
-	}
-	else {
-		++*pos;
-		return true;
-	}
-}
-char *parse_GUID(char const * const str, size_t *pos, size_t const len) {
-	size_t const initial_pos = *pos;
-
-	for ( ;*pos != len && str[*pos] != ' '; ++*pos);
-
-	size_t const GUID_len = *pos - initial_pos;
-	char *GUID = malloc(GUID_len + 1);
-	if (!GUID) {
-		//TODO -- Report Out of Memory to higher layer, rather than crashing
-		assert(false && "Internal Server Error, couldn't allocate memory");
-		return 0;
-	}
-	for (size_t i = 0; i != GUID_len; ++i) {
-		GUID[i] = str[initial_pos+i];
-	}
-	GUID[GUID_len] = '\0';
-	//printf("GUID: %s\n", GUID);
-	return GUID;
-}
-
-bool parse_LongStringStart(char const * str, size_t *pos, size_t const len) {
-	size_t const initial_pos = *pos;
-	if (*pos == len) {
-		return false;
-	}
-	if (str[*pos] != '[') {
-		return false;
-	}
-	++*pos;
-	if (*pos == len) goto fail;
-	for (; *pos != len; ++*pos) {
-		if (str[*pos] == '[') {
-			++*pos;
-			return true;
-		}
-		if (str[*pos] != '=') goto fail;
-	}
-	fail:
-	*pos = initial_pos;
-	return false;
-	}
-
-	char *parse_LongString(char const * const str, size_t *pos, size_t const len) {
-	//fprintf(stderr, "Parsing LongString\n");
-	size_t const initial_pos = *pos;
-
-	bool success = parse_LongStringStart(str, pos, len);
-	if (!success) {
-		return 0;
-	}
-
-	size_t const string_start = *pos;
-	size_t bracket_len = *pos - initial_pos - 2;
-
-	//fprintf(stderr, "Parsed LongStringStart. bracket_len = %zu, string_start = %zu\n", bracket_len, *pos);
-
-	size_t string_end = 0;
-	bool in_bracket = false;
-	bool string_complete = false;
-	for (; *pos != len; ++*pos) {
-		if (in_bracket) {
-			if (*pos - string_end - 1 == bracket_len) {
-				if (str[*pos] == ']') {
-					string_complete = true;
-					++*pos;
-					break;
-				}
-				else {
-					string_end = 0;
-					in_bracket = false;
-					continue;
-				}
-			}
-			else if (str[*pos] == '=') {
-				continue;
-			}
-			else if (str[*pos] == ']' ){
-				string_end = *pos;
-				continue;
-			}
-			assert(false && "Internal Server Error - Invalid State in parse_LongString");
-		}
-		else {
-			if (str[*pos] == ']') {
-				//printf("Found opening ] at pos: %zu\n", *pos);
-				string_end = *pos;
-				in_bracket = true;
-				continue;
-			}
-		}
-	}
-	if (!string_complete) {
-		*pos = initial_pos;
-		return 0;
-	}
-	char *out_str = malloc(string_end-string_start + 1);
-	if (!out_str) {
-		//TODO- Remove this assert; report the error instead.
-		assert(false && "Internal Server Error - Out of Memory");
-		*pos = initial_pos;
-		return 0;
-	}
-	for (size_t i = 0; i != string_end - string_start; ++i) {
-		out_str[i] = str[string_start + i];
-	}
-	out_str[string_end - string_start] = '\0';
-	printf("LongString: %s\n", out_str);
-	return out_str;
-}
-
-TrackPlayIdentifierNode *parse_TrackPlayIdentifierNode(char const * const str, size_t *pos, size_t const len) {
-	size_t const initial_pos = *pos;
-	char *url = 0;
-	TrackPlayIdentifierNode *track = 0;
-
-	char *guid = parse_GUID(str, pos, len);
-	if (!guid) {
-		fprintf(stderr, "Couldn't parse GUID\n");
-		goto fail;
-	}
-	bool success = consume_space(str, pos, len);
-	if (!success) {
-		fprintf(stderr, "Couldn't find track-name after GUID: %s\n", guid);
-		goto fail;
-	}
-
-	url = parse_LongString(str,pos,len);
-	if (!url) {
-		fprintf(stderr, "Couldn't understand track-name after GUID: %s\n", guid);
-		goto fail;
-	}
-	track = malloc(sizeof *track);
-	if (!track) {
-		//TODO - report Out of Memory to higher layer, rather than failing here.
-		assert(false && "Internal Server Error, Out of Memory.");
-		goto fail;
-	}
-	track->next = 0;
-	track->prev = 0;
-	track->track = (TrackPlayIdentifier){.guid = {.guid_str = guid}, .track = {.url = url}};
-	return track;
-	fail:;
-	free(guid);
-	free(url);
-	free(track);
-	*pos = initial_pos;
-	return 0;
-}
-
 void add_track(Playlist *playlist, TrackPlayIdentifierNode *track) {
 	if (playlist->back) {
 		playlist->back->next = track;
@@ -1561,77 +1374,7 @@ void add_track(Playlist *playlist, TrackPlayIdentifierNode *track) {
 	}
 }
 
-bool parse_playlist(Playlist *playlist, char const * const str, size_t *pos, size_t const len) {
-	playlist->front = 0;
-	playlist->back = 0;
-	while (*pos != len) {
-		bool success = consume_space(str, pos, len);
-		if (!success) return false;
-		TrackPlayIdentifierNode *track = parse_TrackPlayIdentifierNode(str, pos, len);
-		if (!track) return false;
-		add_track(playlist, track);
-	}
-	return true;
-}
 
-//FILE *out_file = 0;
-
-Command *parse_command(char const * const str, size_t const len) {
-	/*char *string = malloc(len+1);
-	if (string) {
-		memcpy(string,str,len);
-		string[len] = 0;
-		fprintf(stderr,"%s\n",string);
-	}
-	free(string);*/
-	size_t pos = 0;
-	Command *command = malloc(sizeof *command);
-	if (!command) {return 0;}
-	command->prev = 0;
-	command->next = 0;
-	if (len >= 4 && memcmp(str, "halt", 4) == 0) {
-		command->type = Halt;
-		//command->data.done.cond = SDL_CreateCond();//TODO re-add
-		//command->data.done.mutex = SDL_CreateMutex();
-		command->data.done.done = false;
-		
-		//if (!command->data.done.cond || !command->data.done.mutex) {//TODO re-add
-		//	free_command(command);
-		//	return 0;
-		//}
-	}
-	else if (len >= 5 && memcmp(str, "pause", 5) == 0) {
-		command->type = Pause;
-	}
-	else if (len >= 6 && memcmp(str, "resume", 6) == 0) {
-		command->type = Resume;
-	}
-	else if (len >= 15 && memcmp(str, "update_playlist", 15) == 0) {
-		//printf("Updating Playlist\n");
-		pos = 15;
-		command->type = UpdatePlaylist;
-		bool success = parse_playlist(&command->data.new_playlist, str, &pos, len);
-		if (!success) {
-			free_command(command);
-			return 0;
-		}
-	}
-	else if (len >= 16 && memcmp(str, "replace_playlist", 16) == 0) {
-		//printf("Replacing Playlist\n");
-		pos = 16;
-		command->type = ReplacePlaylist;
-		bool success = parse_playlist(&command->data.new_playlist, str, &pos, len);
-		if (!success) {
-			free_command(command);
-			return 0;
-		}
-	}
-	else {
-		free(command);
-		return 0;
-	}
-	return command;
-}
 
 #if 0
 struct AudioDeviceManager {
@@ -1726,7 +1469,7 @@ int init_command_queue(CommandQueue *commandQueue) {
 //    Doing the wrong thing at the wrong time
 //    Becoming unresponsive.
 //  Possible Mitigation Strategies:
-//   Run the program in a sandbox (chroot, limited hardware access, etc)
+//   Run the program in a sandbox (chroot, limited hardware access, virtualisation, OS container, etc)
 //   Selection of appropriate programming language/technique
 //   Tests
 //   Lint/type checker/static analysis
@@ -1747,21 +1490,18 @@ int init_command_queue(CommandQueue *commandQueue) {
 //   Make the API hard to misuse.
 
 bool has_terminating_newline(char const *line, size_t len) {
-    return len != 0 && line[len-1] == '\n';
+	return len != 0 && line[len-1] == '\n';
 }
-
-#include <sndfile.h>
-#include <alsa/asoundlib.h>
-#include <stdio.h>
-#include <math.h>
-
+/*
 struct InputCallbackData {
 	struct AudioCallbackData *audioCallback;
-};
+	struct ParseState parseState;
+};*/
+#if 0
 void handle_input(size_t in_line_len, char const *in_line, void *ud) {
 	struct InputCallbackData *data = ud;
 	//getline(&in_line,&in_line_len,stdin);// fgetln(stdin, &in_line_len);//TODO re-add
-	if (has_terminating_newline(in_line,in_line_len)) {
+	if (has_terminating_newline(in_line, in_line_len)) {
 		--in_line_len;
 	}
 	Command *command = parse_command(in_line, in_line_len);
@@ -1788,27 +1528,6 @@ void handle_input(size_t in_line_len, char const *in_line, void *ud) {
 			free_command(command);
 		break;
 		#endif
-		case Halt:
-			//Wait for zero crossing, mute and exit. TODO
-			if (queue_command(&data->audioCallback->commandQueue, command) != 0) {
-				free_command(command);
-				//SDL_PauseAudioDevice(audio_dev_id, 1);//TODO re-add
-			}
-			//#if 0 //TODO
-			//else while (!command->done) {
-			//    waitfor(command->done);
-			//}
-			else {
-				//SDL_LockMutex(command->data.done.mutex);//TODO re-add
-				while ( ! command->data.done.done ) {
-					//SDL_CondWait(command->data.done.cond, command->data.done.mutex);
-				}
-				//SDL_UnlockMutex(command->data.done.mutex);
-			}
-			//SDL_PauseAudioDevice(audio_dev_id, 1);//TODO re-add
-		//goto done;//TODO re-add
-		return;
-		//etc(?)
 		default:
 		if (queue_command(&data->audioCallback->commandQueue, command) != 0) {
 			free_command(command);
@@ -1817,15 +1536,16 @@ void handle_input(size_t in_line_len, char const *in_line, void *ud) {
 	}
 }
 #endif
+#endif
 
 
 static int set_hwparams(snd_pcm_t *handle,
                         snd_pcm_hw_params_t *params,
                         snd_pcm_access_t access)
 {
-	unsigned int rrate;
-	snd_pcm_uframes_t size;
-	int err, dir;
+	unsigned int rrate = 0;
+	snd_pcm_uframes_t size = 0;
+	int err = 0, dir = 0;
 	/* choose all parameters */
 	err = snd_pcm_hw_params_any(handle, params);
 	if (err < 0) {
@@ -1943,50 +1663,79 @@ static int set_swparams(snd_pcm_t *handle, snd_pcm_sw_params_t *swparams)
  */
 static int xrun_recovery(snd_pcm_t *handle, int err)
 {
-    if (verbose)
-        printf("stream recovery\n");
-    if (err == -EPIPE) {    /* under-run */
-        err = snd_pcm_prepare(handle);
-        if (err < 0)
-            printf("Can't recovery from underrun, prepare failed: %s\n", snd_strerror(err));
-        return 0;
-    } else if (err == -ESTRPIPE) {
-        while ((err = snd_pcm_resume(handle)) == -EAGAIN)
-            sleep(1);   /* wait until the suspend flag is released */
-        if (err < 0) {
-            err = snd_pcm_prepare(handle);
-            if (err < 0)
-                printf("Can't recovery from suspend, prepare failed: %s\n", snd_strerror(err));
-        }
-        return 0;
-    }
-    return err;
+	if (verbose)
+		printf("stream recovery\n");
+	if (err == -EPIPE) {    /* under-run */
+		err = snd_pcm_prepare(handle);
+		if (err < 0)
+			printf("Can't recovery from underrun, prepare failed: %s\n", snd_strerror(err));
+		return 0;
+	} else if (err == -ESTRPIPE) {
+		while ((err = snd_pcm_resume(handle)) == -EAGAIN)
+			sleep(1);   /* wait until the suspend flag is released */
+		if (err < 0) {
+			err = snd_pcm_prepare(handle);
+			if (err < 0)
+				printf("Can't recovery from suspend, prepare failed: %s\n", snd_strerror(err));
+		}
+		return 0;
+	}
+	return err;
+}
+struct InputReadData {
+	//void *ud;
+	//command_read_callback command_callback; //= command_was_read
+	struct CommandParser *command_parser;
+};
+void inputReadCallback(char const *in_buf, size_t in_buf_size, void *ud) {
+	struct InputReadData *userData = ud;
+	if (CommandParser_execute(userData->command_parser, in_buf, in_buf_size/*, userData->command_callback, userData->ud*/) != 0) {
+		assert(false && "Error parsing input");//TODO
+	}
 }
 
 struct StdInManager {
+	void *ud; /*= struct InputReadData {
+		void *ud;
+		command_read_callback command_callback;
+		CommandParser *command_parser;
+	};*/
+	void (*readCallback)(char const *in_buf, size_t in_buf_size, void *ud); //= inputReadCallback
+
+/*
 	void *ud;// = (struct InputCallbackData){.audioCallback = &callbackData};
 	void (*inputCallback)(size_t in_line_size, char const *in_line, void *ud);
 	size_t input_line_capacity;// = 1;
 	size_t input_line_size;// = 0;
 	char *input_line;/// = malloc(input_line_capacity);
-	int stdinfd;
+*/
+	int inputfd;
 };
 
 void StdInManager_read(struct StdInManager *manager) {
+	char input_data[256];
+	ssize_t bytes_read = read(manager->inputfd, input_data, sizeof input_data);
+	if (bytes_read == -1) {
+		printf("Error reading from stdin\n");
+		assert(false && "Error reading from stdin\n");
+		exit(1);//TODO report error to highter layer.
+	}
+	manager->readCallback(input_data, (size_t)bytes_read, manager->ud);
+#if 0
 	if (manager->input_line_capacity == manager->input_line_size) {
 		manager->input_line = realloc(manager->input_line, manager->input_line_capacity*2);
 		if (!manager->input_line) {
 			printf("Couldn't allocate memory for input line");
-			while(1);
+			exit(1);
 		}
 		manager->input_line_capacity = manager->input_line_capacity*2;
 	}
-	ssize_t bytes_read = read(manager->stdinfd, &manager->input_line[manager->input_line_size], manager->input_line_capacity - manager->input_line_size);
+	ssize_t bytes_read = read(manager->inputfd, &manager->input_line[manager->input_line_size], manager->input_line_capacity - manager->input_line_size);
 	if (bytes_read == -1) {
 		printf("Error reading from stdin");
-		while (1);
+		exit(1);
 	}
-	_Bool foundNewLine = false;
+	bool foundNewLine = false;
 	for (ssize_t i = 0; i < bytes_read; ++i) {
 		if (manager->input_line[manager->input_line_size + i] == '\n') {
 			foundNewLine = true;
@@ -1999,8 +1748,9 @@ void StdInManager_read(struct StdInManager *manager) {
 	if (!foundNewLine) {
 		manager->input_line_size += bytes_read;
 	}
+#endif
 }
-
+#if 0
 void StdInManager_init(struct StdInManager *manager, void (*inputCallback)(size_t in_line_size, char const *in_line, void *ud), void *ud) {
 	manager->ud = ud;
 	manager->inputCallback = inputCallback;
@@ -2011,23 +1761,134 @@ void StdInManager_init(struct StdInManager *manager, void (*inputCallback)(size_
 		fprintf(stderr, "Couldn't allocate memory for StdInManager\n");
 		exit(-1);
 	}
-	manager->stdinfd = fileno(stdin);
+	manager->inputfd = inputfd;
 }
+#endif
+
+void StdInManager_init(struct StdInManager *manager, void (*readCallback)(char const *in_buf, size_t in_buf_size, void *ud), void *ud) {
+	manager->ud = ud;
+	manager->readCallback = readCallback;
+	manager->inputfd = inputfd;
+}
+
 void StdInManager_fill_pollfd(struct StdInManager *manager, struct pollfd *ufd) {
-	ufd->fd = manager->stdinfd;
+	ufd->fd = manager->inputfd;
 	ufd->events = POLLIN;//= (struct pollfd){.fd = manager->stdinfd, .events = POLLIN, .revents = 0};
 }
+#if 0
+struct SocketInManager {
+	void *ud;
+	void (*inputCallback)
+};
+#endif
+struct CommandReadData {
+	struct AudioCallbackData *audioCallback;
+	//OutputBuffer outBuffer;
+};
+int command_was_read(struct Command *command, void *ud) {
+	//Push command into command queue
+	//Or error?
+	struct CommandReadData *data = ud;
+	if (!command) {
+		fprintf(stderr, "Command not understood\n");
+		//OutputBuffer_appendLine(&data->outBuffer, "Command not understood");
+		return 0;
+#if 0 //Need some sort of error recovery.
+		//sizeof(size_t)*CHAR_BIT gives number of bits,
+		//which is strictly less than number of decimal
+		//digits for positive numbers of bits. +4 because of %, s, \n and \0
+		//Strictly speaking this should be ceil(sizeof(size_t)*CHAR_BIT*log_10(2))+4,
+		//but the C preprocesor can't do floating point arithmetic.
+		char format_str[sizeof (size_t) * CHAR_BIT + 4];
+		sprintf(format_str, "%%.%zus\n", in_line_len);
+		fprintf(stderr, format_str, in_line);
+		return;
+		//continue;//TODO re-add
+#endif
+		//assert(false && "Command not read correctly");
+		//exit(-1);
+	}
+	switch (command->type) {
+		#if 0 //TODO
+		case GetCurrentState:
+			PlayState state = get_current_state();
+			char const *state_string = serialise_PlayState(&state);
+			puts(state_string); //need access to i/o file descriptor.
+			                    //should defer output until it is ready to read.
+			free(state_string);
+			free_command(command);
+		break;
+		#endif
+		default:
+		if (queue_command(&data->audioCallback->commandQueue, command) != 0) {
+			free_command(command);
+			return -1;
+		}
+		break;
+	}
+	return 0;
+}
+
 static int write_and_poll_loop(snd_pcm_t *handle)
 {
+	//TODO: Design+Implement error recovery scheme (especially for all the callbacks).
+	//TODO; Perhaps make the halt-command separate? (Rationale:
+	// - Normal operation shouldn't be able to cause the system to quit, this should be a separate channel.
+	// - When a halt command is received, the system shuts down and everything stops (and in particular, future commands are ignored),
+	//   this is a fundamentally different behaviour from all the other commands).
 	struct AudioCallbackData callbackData;
 	init_command_queue(&callbackData.commandQueue);
 	init_PlaylistPlayer(&callbackData.player);
 	callbackData.halt_command = 0;
+	
+	struct CommandReadData commandReadData = (struct CommandReadData){
+		.audioCallback = &callbackData
+	};
+	
+	struct CommandParser *parser = new_CommandParser(command_was_read, &commandReadData);
+	if (!parser) {
+		printf("Couldn't allocate command parser");//TODO Proper error handling
+		exit(-1);
+	}
+	
+	//struct InputCallbackData inputCallback = (struct InputCallbackData){.audioCallback = &callbackData};
+	struct InputReadData inputReadData = (struct InputReadData){
+		//.ud = &commandReadData,
+		//.command_callback = command_was_read, //These are internally referenced by the CommandParser,
+		//                                      //so are unneeded for now, but when we support arbitrary numbers of connections
+		//                                      //we will need to *allocate/deallocate* a CommandReadData and CommandParser per connection.
+		.command_parser = parser,
+	};	/*void *ud;
+	command_read_callback command_callback;
+	CommandParser *command_parser;*/
+	//assert(false);//TODO
+	
+	//
+	//Produce fd-readers+parsers for each incoming connection
+	// Read data in via fd-reader (StdInManager)
+	//  Each read produces callback into Parser.
+	//   Each command produces callback into command_read
 
-	struct InputCallbackData inputCallback = (struct InputCallbackData){.audioCallback = &callbackData};
+	//
+	//data {
+	//  Socket data {
+	//    Socket fd
+	//    Connection fd list? (or something like that)
+	//  }
+	//  AudioCommandQueue (Command queue && Halt-command)
+	//  fd_reader_callback (calls parser)
+	//  Array of: (One-per-fd) {
+	//    fd_read_data {
+	//      ParserData
+	//      Command Read callback
+	//      AudioCommandQueue (pointer)
+	//    }
+	//  }
+	//  //TODO: Error data?
+	//}
 
 	struct StdInManager stdin_manager;
-	StdInManager_init(&stdin_manager, &handle_input, &inputCallback);
+	StdInManager_init(&stdin_manager, &inputReadCallback, &inputReadData);
 
 	struct pollfd *ufds;
 	signed short *ptr;
@@ -2048,11 +1909,11 @@ static int write_and_poll_loop(snd_pcm_t *handle)
 	}
 	StdInManager_fill_pollfd(&stdin_manager, &ufds[count]);
 	init = 1;
-	while (1) {
+	while (!(callbackData.halt_command && callbackData.halt_command->data.done.done)) {
 		if (!init) {
 			{
 				unsigned short revents;
-				_Bool gotEvent = false;
+				bool gotEvent = false;
 				while (!gotEvent) {
 					poll(ufds, count+1, -1);
 					snd_pcm_poll_descriptors_revents(handle, ufds, count, &revents);
@@ -2115,7 +1976,7 @@ static int write_and_poll_loop(snd_pcm_t *handle)
 			//err = wait_for_poll(handle, ufds, count);
 			{
 				unsigned short revents;
-				_Bool gotEvent = false;
+				bool gotEvent = false;
 				while (!gotEvent) {
 					poll(ufds, count+1, -1);
 					snd_pcm_poll_descriptors_revents(handle, ufds, count, &revents);
@@ -2152,17 +2013,30 @@ static int write_and_poll_loop(snd_pcm_t *handle)
 		}
 		free(buf);
 	}
+	free_command(callbackData.halt_command);
+	free(ufds);
+	delete_CommandParser(parser);
+	return 0;
 }
+int do_main(void) {
+	int n = sd_listen_fds(0);
+	if (n > 1) {
+		fprintf(stderr, "Too many file descriptors received.\n");
+		return 1;
+	}
+	else if (n == 1) {
+		inputfd = SD_LISTEN_FDS_START + 0;
+		outputfd = SD_LISTEN_FDS_START + 0;
+	}
+	else {
+		inputfd = fileno(stdin);
+		outputfd = fileno(stdout);
+	}
 
-int main(void)
-{
 	snd_pcm_t *handle;
 	int err;
 	snd_pcm_hw_params_t *hwparams;
 	snd_pcm_sw_params_t *swparams;
-	signed short *samples;
-	unsigned int chn;
-	snd_pcm_channel_area_t *areas;
 	snd_pcm_hw_params_alloca(&hwparams);
 	snd_pcm_sw_params_alloca(&swparams);
 	err = snd_output_stdio_attach(&output, stdout, 0);
@@ -2185,13 +2059,17 @@ int main(void)
 		printf("Setting of swparams failed: %s\n", snd_strerror(err));
 		exit(EXIT_FAILURE);
 	}
-	if (verbose > 0)
+	//if (verbose > 0)
 		snd_pcm_dump(handle, output);
-
+	snd_config_update_free_global();
 	err = write_and_poll_loop(handle);
 	if (err < 0)
 		printf("Transfer failed: %s\n", snd_strerror(err));
 
 	snd_pcm_close(handle);
 	return 0;
+}
+int main(void)
+{
+	return do_main();
 }
