@@ -208,28 +208,6 @@ struct Command *dequeue_command(CommandQueue *commandQueue) {
 	return command;
 }
 typedef struct {
-	//void init(char const *url);
-	//void start_cache(size_t pos);
-	//void set_highwater(size_t max_cache_size);
-	//void set_lowwater(size_t min_cache_size);
-	//void get_frames(Uint8 *const stream, int const len);
-	//prev_non_positive, prev_non_negative
-	SNDFILE *file;
-} FileCache;
-
-typedef struct FileCacheNode_ {
-	struct FileCacheNode_ *next;
-	struct FileCacheNode_ *prev;
-	GUID track_guid;
-	FileCache cache;
-} FileCacheNode;
-
-typedef struct {
-	FileCacheNode *front;
-	FileCacheNode *back;
-} FileCacheList;
-
-typedef struct {
 	FileCache cache;
 	TrackPlayIdentifier *track;
 
@@ -329,6 +307,29 @@ void init_PlaylistPlayer(PlaylistPlayer *player) {
 
 	player->state.phase = SILENCE;
 	player->state.want_silence = true;
+}
+
+
+void destroy_Playlist(Playlist *playlist) {
+	//For now, this is more like 'clear_Playlist' function.
+	if (playlist->front) {
+		playlist->dirty = true;
+		delete_forwards_TrackPlayIdentifierNode(playlist->front);
+		playlist->front = 0;
+		playlist->back = 0;
+	}
+}
+void destroy_CacheList(FileCacheList *cachelist) {
+	delete_forwards_FileCacheNode(cachelist->front);
+}
+
+void free_PlaylistPlayer(PlaylistPlayer *player) {
+	//assert(false);
+	destroy_Playlist(&player->playlist);
+	destroy_CacheList(&player->cachelist);
+	//destroy_TrackPlayState 	//TODO? Or these don't actually require any deallocation.
+	//destroy_PlayResumeManager
+	//destroy_PlayerState
 }
 #if 0
 //typedef struct {} Input;
@@ -1388,6 +1389,15 @@ void file_loader() {
 
 }
 
+
+void delete_forwards_Command(struct Command *command) {
+	while (command) {
+		struct Command *next_command = command->next;
+		free_command(command);
+		command = next_command;
+	}
+}
+
 int init_command_queue(CommandQueue *commandQueue) {
 	//SDL_mutex *mutex = SDL_CreateMutex();//TODO re-add
 	//if (!mutex) return 1;
@@ -1395,6 +1405,12 @@ int init_command_queue(CommandQueue *commandQueue) {
 	commandQueue->front = 0;
 	commandQueue->back = 0;
 	return 0;
+}
+
+void free_command_queue(CommandQueue *commandQueue) {
+	if (commandQueue->front) {
+		delete_forwards_Command(commandQueue->front);
+	}
 }
 
 //Control Abilities:
@@ -1539,9 +1555,10 @@ void handle_input(size_t in_line_len, char const *in_line, void *ud) {
 #endif
 
 
-static int set_hwparams(snd_pcm_t *handle,
-                        snd_pcm_hw_params_t *params,
-                        snd_pcm_access_t access)
+static int set_hwparams(
+	snd_pcm_t *handle,
+	snd_pcm_hw_params_t *params,
+	snd_pcm_access_t access)
 {
 	unsigned int rrate = 0;
 	snd_pcm_uframes_t size = 0;
@@ -1829,6 +1846,53 @@ int command_was_read(struct Command *command, void *ud) {
 	return 0;
 }
 
+static int poll_and_dispatch_events(struct pollfd *ufds, int num_pcm_descriptors, struct StdInManager *stdin_manager, bool *init, snd_pcm_t *handle) {
+	int err = 0;
+	unsigned short revents = 0;
+	bool gotEvent = false;
+	while (!gotEvent) {
+		poll(ufds, num_pcm_descriptors+1, -1);
+		snd_pcm_poll_descriptors_revents(handle, ufds, num_pcm_descriptors, &revents);
+		if (revents & POLLERR) {
+			err = -EIO;
+			if (snd_pcm_state(handle) == SND_PCM_STATE_XRUN ||
+				snd_pcm_state(handle) == SND_PCM_STATE_SUSPENDED) {
+				err = snd_pcm_state(handle) == SND_PCM_STATE_XRUN ? -EPIPE : -ESTRPIPE;
+				if (xrun_recovery(handle, err) < 0) {
+					printf("Write error: %s\n", snd_strerror(err));
+					exit(EXIT_FAILURE);
+				}
+				*init = 1;
+			} else {
+				printf("Wait for poll failed\n");
+				return err;
+			}
+			gotEvent = true;
+		}
+		if (revents & POLLOUT) {
+			err = 0;
+			gotEvent = true;
+		}
+		if (ufds[num_pcm_descriptors].revents & POLLERR) {
+			fprintf(stderr, "Error reading stdin\n");
+			exit(-1);
+		}
+		if (ufds[num_pcm_descriptors].revents & POLLIN) {
+			StdInManager_read(stdin_manager);
+			//gotEvent = true;
+		}
+		/*
+		 * for (int i = 0; i < num_in_connections; ++i) {
+		 *     if(ufds[first_in_connection+i].revents & POLLIN) {
+		 *         Connection_read(&connections[i]);
+		 *     }
+		 * }
+		 * 
+		 */
+	}
+	return err;
+}
+
 static int write_and_poll_loop(snd_pcm_t *handle)
 {
 	//TODO: Design+Implement error recovery scheme (especially for all the callbacks).
@@ -1887,36 +1951,47 @@ static int write_and_poll_loop(snd_pcm_t *handle)
 	//  //TODO: Error data?
 	//}
 
+	//struct InConnectionManager in_connection_manager;
+	//InConnectionManager_init(&in_connection_manager, socketfd);//TODO
+	
+	//int in_connection_poll_descriptors = InConnectionManager_poll_descriptors_count(&in_connection_manager);
+	
 	struct StdInManager stdin_manager;
 	StdInManager_init(&stdin_manager, &inputReadCallback, &inputReadData);
 
 	struct pollfd *ufds;
 	signed short *ptr;
-	int err, count, cptr, init;
-	count = snd_pcm_poll_descriptors_count (handle);
-	if (count <= 0) {
-		printf("Invalid poll descriptors count\n");
-		return count;
+	int err, num_pcm_descriptors, cptr;
+	bool init = false;
+	num_pcm_descriptors = snd_pcm_poll_descriptors_count(handle);
+	if (num_pcm_descriptors <= 0) {
+		printf("Invalid snd_pcm_poll_descriptors_count\n");
+		return num_pcm_descriptors;
 	}
-	ufds = malloc(sizeof(struct pollfd) * (count+1));
+	//int num_poll_descriptors = num_pcm_descriptors+1; //pcm+socket.
+	                                    //As connections occur on the socket, more
+	                                    //file descriptors will be added to the list.
+	ufds = malloc(sizeof(struct pollfd) * (num_pcm_descriptors+1));
 	if (ufds == NULL) {
 		printf("No enough memory\n");
 		return -ENOMEM;
 	}
-	if ((err = snd_pcm_poll_descriptors(handle, ufds, count)) < 0) {
+	if ((err = snd_pcm_poll_descriptors(handle, ufds, num_pcm_descriptors)) < 0) {
 		printf("Unable to obtain poll descriptors for playback: %s\n", snd_strerror(err));
 		return err;
 	}
-	StdInManager_fill_pollfd(&stdin_manager, &ufds[count]);
+	StdInManager_fill_pollfd(&stdin_manager, &ufds[num_pcm_descriptors]);
 	init = 1;
 	while (!(callbackData.halt_command && callbackData.halt_command->data.done.done)) {
 		if (!init) {
+			poll_and_dispatch_events(ufds, num_pcm_descriptors, &stdin_manager, &init, handle);
+#if 0
 			{
 				unsigned short revents;
 				bool gotEvent = false;
 				while (!gotEvent) {
-					poll(ufds, count+1, -1);
-					snd_pcm_poll_descriptors_revents(handle, ufds, count, &revents);
+					poll(ufds, num_pcm_descriptors+1, -1);
+					snd_pcm_poll_descriptors_revents(handle, ufds, num_pcm_descriptors, &revents);
 					if (revents & POLLERR) {
 						err = -EIO;
 						if (snd_pcm_state(handle) == SND_PCM_STATE_XRUN ||
@@ -1937,16 +2012,17 @@ static int write_and_poll_loop(snd_pcm_t *handle)
 						err = 0;
 						gotEvent = true;
 					}
-					if (ufds[count].revents & POLLERR) {
+					if (ufds[num_pcm_descriptors].revents & POLLERR) {
 						fprintf(stderr, "Error reading stdin\n");
 						exit(-1);
 					}
-					if (ufds[count].revents & POLLIN) {
+					if (ufds[num_pcm_descriptors].revents & POLLIN) {
 						StdInManager_read(&stdin_manager);
 						//gotEvent = true;
 					}
 				}	
 			}
+#endif
 		}
 		int avail = snd_pcm_avail_update(handle);
 		short * const buf = malloc(avail * channels * snd_pcm_format_physical_width(format)/CHAR_BIT);
@@ -1965,21 +2041,21 @@ static int write_and_poll_loop(snd_pcm_t *handle)
 				init = 1;
 				break;  /* skip one period */
 			}
-			if (snd_pcm_state(handle) == SND_PCM_STATE_RUNNING)
-				init = 0;
+			if (snd_pcm_state(handle) == SND_PCM_STATE_RUNNING) init = 0;
 			ptr += err * channels;
 			cptr -= err;
-			if (cptr == 0)
-				break;
+			if (cptr == 0) break;
 			/* it is possible, that the initial buffer cannot store */
 			/* all data from the last period, so wait awhile */
-			//err = wait_for_poll(handle, ufds, count);
+			//err = wait_for_poll(handle, ufds, num_pcm_descriptors);
+			poll_and_dispatch_events(ufds, num_pcm_descriptors, &stdin_manager, &init, handle);
+#if 0
 			{
 				unsigned short revents;
 				bool gotEvent = false;
 				while (!gotEvent) {
-					poll(ufds, count+1, -1);
-					snd_pcm_poll_descriptors_revents(handle, ufds, count, &revents);
+					poll(ufds, num_pcm_descriptors+1, -1);
+					snd_pcm_poll_descriptors_revents(handle, ufds, num_pcm_descriptors, &revents);
 					if (revents & POLLERR) {
 						err = -EIO;
 							if (snd_pcm_state(handle) == SND_PCM_STATE_XRUN ||
@@ -2000,19 +2076,22 @@ static int write_and_poll_loop(snd_pcm_t *handle)
 						err = 0;
 						gotEvent = true;
 					}
-					if (ufds[count].revents & POLLERR) {
+					if (ufds[num_pcm_descriptors].revents & POLLERR) {
 						fprintf(stderr, "Error reading stdin\n");
 						exit(-1);
 					}
-					if (ufds[count].revents & POLLIN) {
+					if (ufds[num_pcm_descriptors].revents & POLLIN) {
 						StdInManager_read(&stdin_manager);
 						//gotEvent = true;
 					}
 				}	
 			}
+#endif
 		}
 		free(buf);
 	}
+	free_command_queue(&callbackData.commandQueue);
+	free_PlaylistPlayer(&callbackData.player);
 	free_command(callbackData.halt_command);
 	free(ufds);
 	delete_CommandParser(parser);
