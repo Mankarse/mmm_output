@@ -15,7 +15,7 @@ struct LineManager {
 	size_t input_line_size;// = 0;
 	char *input_line;// = malloc(input_line_capacity);
 };
-int create_LineManager(struct LineManager *uninitialisedMemory, void (*inputCallback)(size_t in_line_size, char const *in_line, void *ud), void *ud) {
+static int create_LineManager(struct LineManager *uninitialisedMemory, void (*inputCallback)(size_t in_line_size, char const *in_line, void *ud), void *ud) {
 	uninitialisedMemory->ud = ud;
 	uninitialisedMemory->inputCallback = inputCallback;
 	
@@ -28,15 +28,15 @@ int create_LineManager(struct LineManager *uninitialisedMemory, void (*inputCall
 	return 0;
 }
 
-void destroy_LineManager(struct LineManager *lineManager) {
+static void destroy_LineManager(struct LineManager *lineManager) {
 	free(lineManager->input_line);
 }
 
-int LineManager_read(struct LineManager *manager, char const *in_data, size_t in_data_size) {
+static int LineManager_read(struct LineManager *manager, char const *in_data, size_t in_data_size) {
 	while (manager->input_line_capacity < manager->input_line_size + in_data_size) {
 		manager->input_line = realloc(manager->input_line, manager->input_line_capacity*2);
 		if (!manager->input_line) {
-			printf("Couldn't allocate memory for input line");//TODO: remove ad-hoc printf.
+			printf("Couldn't allocate memory for input line\n");//TODO: remove ad-hoc printf.
 			return -1;
 		}
 		manager->input_line_capacity = manager->input_line_capacity*2;
@@ -99,7 +99,7 @@ void delete_CommandParser(struct CommandParser *commandParser) {
 	free(commandParser);
 }
 
-bool consume_space(char const * const str, size_t *pos, size_t const len) {
+static bool consume_space(char const * const str, size_t *pos, size_t const len) {
 	if (*pos >= len || str[*pos] != ' ') {
 		return false;
 	}
@@ -108,7 +108,7 @@ bool consume_space(char const * const str, size_t *pos, size_t const len) {
 		return true;
 	}
 }
-char *parse_GUID(char const * const str, size_t *pos, size_t const len) {
+static char *parse_GUID(char const * const str, size_t *pos, size_t const len) {
 	size_t const initial_pos = *pos;
 
 	for ( ;*pos != len && str[*pos] != ' '; ++*pos);
@@ -128,7 +128,7 @@ char *parse_GUID(char const * const str, size_t *pos, size_t const len) {
 	return GUID;
 }
 
-bool parse_LongStringStart(char const * str, size_t *pos, size_t const len) {
+static bool parse_LongStringStart(char const * str, size_t *pos, size_t const len) {
 	size_t const initial_pos = *pos;
 	if (*pos == len) {
 		return false;
@@ -150,7 +150,7 @@ bool parse_LongStringStart(char const * str, size_t *pos, size_t const len) {
 	return false;
 }
 
-char *parse_LongString(char const * const str, size_t *pos, size_t const len) {
+static char *parse_LongString(char const * const str, size_t *pos, size_t const len) {
 	//fprintf(stderr, "Parsing LongString\n");
 	size_t const initial_pos = *pos;
 
@@ -218,7 +218,7 @@ char *parse_LongString(char const * const str, size_t *pos, size_t const len) {
 	return out_str;
 }
 
-TrackPlayIdentifierNode *parse_TrackPlayIdentifierNode(char const * const str, size_t *pos, size_t const len) {
+static TrackPlayIdentifierNode *parse_TrackPlayIdentifierNode(char const * const str, size_t *pos, size_t const len) {
 	size_t const initial_pos = *pos;
 	char *url = 0;
 	TrackPlayIdentifierNode *track = 0;
@@ -257,7 +257,7 @@ TrackPlayIdentifierNode *parse_TrackPlayIdentifierNode(char const * const str, s
 	return 0;
 }
 
-bool parse_playlist(Playlist *playlist, char const * const str, size_t *pos, size_t const len) {
+static bool parse_playlist(Playlist *playlist, char const * const str, size_t *pos, size_t const len) {
 	playlist->front = 0;
 	playlist->back = 0;
 	while (*pos != len) {

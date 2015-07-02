@@ -1,9 +1,17 @@
 #if 1
-//
+//#define _POSIX_C_SOURCE 200809L
 #include "main.h"
 #include "command_parser.h"
-
+//When compiling with std=c11 on linux,
+//ALSA incorrectly redefined timespec and timeval.
+//These defines stop <time.h> from defining timespec or timeval,
+//and so allow us to use ALSA's definitions
+//ALSA also requires alloca for 
+#include <alloca.h>
+//#define __timespec_defined 1
 #include <alsa/asoundlib.h>
+//#undef __timespec_defined
+//#define _STRUCT_TIMEVAL 1
 #include <sndfile.h>
 
 #include <stdio.h>
@@ -37,8 +45,12 @@
 
 #include <systemd/sd-daemon.h>
 
-int inputfd = -1;
-int outputfd = -1;
+#include <sys/socket.h>
+#include<sys/socket.h>
+#include<arpa/inet.h>	//inet_addr
+
+static int inputfd = -1;
+static int outputfd = -1;
 /*
 static FILE *input_source = 0;//stdin
 static FILE *output_sink = 0;//stdout
@@ -49,19 +61,23 @@ static FILE *log_sink = 0;//log file
 //Used to determine when lines in each file were printed relative to each other.
 //static unsigned long long output_count = 0;
 
-
+//These global constants are initial suggestions for parameters.
+//During initialisation, they are automatically updated to actually achieveable values
+//by ALSA. The glboal constants are updated during this process.
 static char *device = "default";         /* playback device */
 static snd_pcm_format_t format = SND_PCM_FORMAT_S16;    /* sample format */
 static unsigned int rate = 44100;           /* stream rate */
 static unsigned int channels = 2;           /* count of channels */
-static unsigned int buffer_time = 500000;       /* ring buffer length in us */
-static unsigned int period_time = 100000;       /* period time in us */
-static int verbose = 0;                 /* verbose flag */
-static int resample = 1;                /* enable alsa-lib resampling */
-static int period_event = 0;                /* produce poll event after each period */
-static snd_pcm_sframes_t buffer_size;
-static snd_pcm_sframes_t period_size;
-static snd_output_t *output = NULL;
+//These two parameters affect latency, likelihood of underrun and power usage.
+//Choose wisely.
+static unsigned int buffer_time = 50000;       /* Ring buffer length in us. Determines the latency of the system after data has been transfered. (?)*/
+static unsigned int period_time = 50000;       /* Period time in us. Determines how much data is requested at a time. Capped to approx period_time <= buffer_time/3 (?)*/
+//static int verbose = 0;                 /* verbose flag */
+static unsigned int resample = 1;                /* enable alsa-lib resampling */
+static int period_event = 1;                /* produce poll event after each period */ /*TODO: was 0*/
+static snd_pcm_sframes_t buffer_size; //Number of frames in buffer_time at the given sample rate
+static snd_pcm_sframes_t period_size; //Number of frames in period_time at the given sample rate
+//static snd_output_t *output = NULL;
 
 //Need a strategy for handling errors:
 // Which errors to attempt to recover from?
@@ -101,41 +117,31 @@ static snd_output_t *output = NULL;
 // Multiple data formats (requires starting/stopping output devices dynamically.)
 // Direct Stream Digital support (requires some sort of rethinking of how we treat samples)
 // Sequencer, support for rendering of MIDI (and similar formats)
+// Gracefully handle Hardware disconnection.
 
 
-//TODO: dynamic number of channels, rather than hardcoding 2;
-//      will require changes to the rest of the code.
-//      In particular, a significant restructuring would
-//      allow for dynamic output formats (channels, sample rate).
-//      This is only a slightly useful feature. Generally, hardware
-//      only supports a small number of formats, and input files are only in a small number of formats.
-//      So the format could work if it is set up at compile time or at initialisation time.
-//      However, ideally the format could dynamically change, to allow bit-perfect output whenever
-//      the hardware/input combination allows, and to allow playing of non-hardware supported
-//      formats through resampling.
-#define NUM_CHANNELS 2
 
-void destroy_GUID(GUID *guid) {
+static void destroy_GUID(GUID *guid) {
 	free(guid->guid_str);
 }
-void destroy_Track(Track *track) {
+static void destroy_Track(Track *track) {
 	free(track->url);
 }
 
-void destroy_TrackPlayIdentifier(TrackPlayIdentifier *track) {
+static void destroy_TrackPlayIdentifier(TrackPlayIdentifier *track) {
 	destroy_GUID(&track->guid);
 	destroy_Track(&track->track);
 }
-void delete_TrackPlayIdentifier(TrackPlayIdentifier *track) {
+static void delete_TrackPlayIdentifier(TrackPlayIdentifier *track) {
 	destroy_TrackPlayIdentifier(track);
 	free(track);
 }
 
-void delete_TrackPlayIdentifierNode(TrackPlayIdentifierNode *node) {
+static void delete_TrackPlayIdentifierNode(TrackPlayIdentifierNode *node) {
 	destroy_TrackPlayIdentifier(&node->track);
 	free(node);
 }
-void delete_forwards_TrackPlayIdentifierNode(TrackPlayIdentifierNode *track) {
+static void delete_forwards_TrackPlayIdentifierNode(TrackPlayIdentifierNode *track) {
 	while (track) {
 		TrackPlayIdentifierNode *next_track = track->next;
 		delete_TrackPlayIdentifierNode(track);
@@ -166,7 +172,7 @@ typedef struct {
 	struct Command *back;
 } CommandQueue;
 
-int queue_command(CommandQueue *commandQueue, struct Command* command) {
+static int queue_command(CommandQueue *commandQueue, struct Command* command) {
 	//Adds `command` to the front of the queue;
 	if (!commandQueue->front) {
 		commandQueue->front = command;
@@ -184,7 +190,7 @@ int queue_command(CommandQueue *commandQueue, struct Command* command) {
 	return 0;
 }
 
-struct Command *dequeue_command(CommandQueue *commandQueue) {
+static struct Command *dequeue_command(CommandQueue *commandQueue) {
 	//Removes the the command from the end of the queue
 	//and returns it.
 	//Returns NULL on the queue being empty;
@@ -207,17 +213,7 @@ struct Command *dequeue_command(CommandQueue *commandQueue) {
 	end:
 	return command;
 }
-typedef struct {
-	FileCache cache;
-	TrackPlayIdentifier *track;
 
-	//Describe the positivity/negativity of the previous
-	//frame of the track. Used to determine whether the
-	//track can be muted/unmuted without a pop.
-	bool prev_non_negative[NUM_CHANNELS]; //Maybe put these into FileCache
-	bool prev_non_positive[NUM_CHANNELS];
-	bool muted[NUM_CHANNELS];
-} TrackPlayState;
 void nullify_TrackPlayState(TrackPlayState *state);
 typedef struct {
 	//bool left_prev_positive;
@@ -292,7 +288,7 @@ typedef struct {
 	//void update_playlist(Playlist *new_playlist);
 } PlaylistPlayer;
 
-void init_PlaylistPlayer(PlaylistPlayer *player) {
+static void init_PlaylistPlayer(PlaylistPlayer *player) {
 	player->playlist.front = 0;
 	player->playlist.back = 0;
 	player->playlist.dirty = false;
@@ -310,7 +306,7 @@ void init_PlaylistPlayer(PlaylistPlayer *player) {
 }
 
 
-void destroy_Playlist(Playlist *playlist) {
+static void destroy_Playlist(Playlist *playlist) {
 	//For now, this is more like 'clear_Playlist' function.
 	if (playlist->front) {
 		playlist->dirty = true;
@@ -319,20 +315,21 @@ void destroy_Playlist(Playlist *playlist) {
 		playlist->back = 0;
 	}
 }
-void destroy_CacheList(FileCacheList *cachelist) {
+static void destroy_CacheList(FileCacheList *cachelist) {
 	delete_forwards_FileCacheNode(cachelist->front);
 }
 
-void free_PlaylistPlayer(PlaylistPlayer *player) {
+static void free_PlaylistPlayer(PlaylistPlayer *player) {
 	//assert(false);
 	destroy_Playlist(&player->playlist);
 	destroy_CacheList(&player->cachelist);
-	//destroy_TrackPlayState 	//TODO? Or these don't actually require any deallocation.
+	destroy_TrackPlayState(&player->currentTrack); 	//TODO? Or these don't actually require any deallocation.
 	//destroy_PlayResumeManager
 	//destroy_PlayerState
 }
 #if 0
 //typedef struct {} Input;
+
 struct ResumingInput {
     Input *nextInput;
 };
@@ -362,12 +359,12 @@ struct PlaylistInput {
 //Going to stop playing track from middle of physical track
 //
 
-bool TrackPlayIdentifier_compatible_with(TrackPlayIdentifier const *l, TrackPlayIdentifier const *r) {
+static bool TrackPlayIdentifier_compatible_with(TrackPlayIdentifier const *l, TrackPlayIdentifier const *r) {
 	if (l == 0 || r == 0) return l == 0 && r == 0;
 	return strcmp(l->guid.guid_str, r->guid.guid_str) == 0 && strcmp(l->track.url, r->track.url) == 0;
 }
 
-void destroy_FileCache(FileCache *cache) {
+static void destroy_FileCache(FileCache *cache) {
 	sf_close(cache->file);
 }
 
@@ -383,18 +380,19 @@ void nullify_TrackPlayState(TrackPlayState *state) {
 	state->track = 0;
 }
 
-void move_FileCache(FileCache *l, FileCache *r) {
+static void move_FileCache(FileCache *l, FileCache *r) {
 	*l = *r;
 	r->file = 0;
 }
 
-void delete_FileCacheNode(FileCacheNode *p) {
+static void delete_FileCacheNode(FileCacheNode *p) {
 	destroy_FileCache(&p->cache);
 	destroy_GUID(&p->track_guid);
 	free(p);
 }
-int create_TrackCache(FileCache *cache, Track *track) {
+static int create_TrackCache(FileCache *cache, Track *track) {
 	SF_INFO file_info;
+	memset(&file_info, 0, sizeof file_info);
 	cache->file = sf_open(track->url, SFM_READ, &file_info);
 	if (!cache->file) {
 		fprintf(stderr, "unable to open file %s\n", track->url);
@@ -415,12 +413,12 @@ int create_TrackCache(FileCache *cache, Track *track) {
 	return 0;
 }
 
-TrackPlayIdentifier *copy_TrackPlayIdentifier(TrackPlayIdentifier *old) {
+static TrackPlayIdentifier *copy_TrackPlayIdentifier(TrackPlayIdentifier *old) {
 	if (!old) return 0;
 
 	TrackPlayIdentifier *ret = malloc(sizeof *ret);
 	if (!ret) return 0;
-	ret->guid.guid_str = strdup(old->guid.guid_str);
+	ret->guid.guid_str = strdup(old->guid.guid_str); //TODO: write our own strdup? strdup not part of C11
 	if (!ret->guid.guid_str) {
 		free(ret);
 		return 0;
@@ -434,7 +432,7 @@ TrackPlayIdentifier *copy_TrackPlayIdentifier(TrackPlayIdentifier *old) {
 	return ret;
 }
 
-void create_TrackPlayState(TrackPlayState *state, TrackPlayIdentifier *track, FileCache *file) {
+static void create_TrackPlayState(TrackPlayState *state, TrackPlayIdentifier *track, FileCache *file) {
 	move_FileCache(&state->cache, file);
 
 	state->track = copy_TrackPlayIdentifier(track);
@@ -471,7 +469,7 @@ void create_TrackPlayState(TrackPlayState *state, TrackPlayIdentifier *track, Fi
 	}
 }
 
-bool all(bool *arr, size_t const len) {
+static bool all(bool *arr, size_t const len) {
 	for (size_t i = 0; i != len; ++i) {
 		if (!arr[i]) return false;
 	}
@@ -479,7 +477,7 @@ bool all(bool *arr, size_t const len) {
 }
 
 //TODO some way of signalling an error in do_pause.
-size_t PauseResumeManager_do_pause(
+static size_t PauseResumeManager_do_pause(
     PauseResumeManager *pauser, size_t pos, short (*const out)[NUM_CHANNELS], size_t const out_len, bool *const pause_finished)
 {
 	//Current algorithm:
@@ -543,14 +541,14 @@ size_t PauseResumeManager_do_pause(
 	}
 	return pos;
 }
-bool any(bool *arr, size_t const len) {
+static bool any(bool *arr, size_t const len) {
 	for (size_t i = 0; i != len; ++i) {
 		if (arr[i]) return true;
 	}
 	return false;
 }
 
-size_t PauseResumeManager_do_resume(
+static size_t PauseResumeManager_do_resume(
     PauseResumeManager *resumer, size_t pos, short (* const out)[NUM_CHANNELS], size_t const out_len, bool * const resume_finished)
 {
 	//Current algorithm:
@@ -606,11 +604,11 @@ size_t PauseResumeManager_do_resume(
 
 
 
-bool TrackPlayState_is_null(TrackPlayState *state) {
+static bool TrackPlayState_is_null(TrackPlayState *state) {
 	return state->track == 0;
 }
 
-size_t PlaylistPlayer_do_silence(size_t current_frame, short (* const buf)[NUM_CHANNELS], size_t buf_len)
+static size_t PlaylistPlayer_do_silence(size_t current_frame, short (* const buf)[NUM_CHANNELS], size_t buf_len)
 {
 	for (;current_frame != buf_len; ++current_frame) {
 		for (size_t chan = 0; chan != NUM_CHANNELS; ++chan) {
@@ -620,11 +618,11 @@ size_t PlaylistPlayer_do_silence(size_t current_frame, short (* const buf)[NUM_C
 	return current_frame;
 }
 
-size_t PlaylistPlayer_do_play(
+static size_t PlaylistPlayer_do_play(
     PlaylistPlayer *player, size_t current_frame, short (* const buf)[NUM_CHANNELS], size_t buf_len, bool * const finished_playing)
 {
-	sf_count_t frames_read = sf_readf_short(player->currentTrack.cache.file,buf[current_frame],buf_len - current_frame);
-	current_frame += frames_read;
+	sf_count_t frames_read = sf_readf_short(player->currentTrack.cache.file,buf[current_frame], (sf_count_t)(buf_len - current_frame));//TODO integer overflow
+	current_frame += (size_t)frames_read;
 
 	if (frames_read != 0) {
 		for (size_t chan = 0; chan != NUM_CHANNELS; ++chan) {
@@ -640,10 +638,11 @@ size_t PlaylistPlayer_do_play(
 //UpNext:
 // Paused
 // PlayPlaylist
-void PlaylistPlayer_get_frames(PlaylistPlayer *player, unsigned char *const stream, int const len) {
+static void PlaylistPlayer_get_frames(PlaylistPlayer *player, unsigned char *const stream, int const len) {
 	short (* const buf)[NUM_CHANNELS] = (short(*)[NUM_CHANNELS])stream;
+	assert(len >= 0);
 	size_t current_frame = 0;
-	size_t buf_len = len/sizeof (short[NUM_CHANNELS]);
+	size_t buf_len = ((size_t)len)/sizeof (short[NUM_CHANNELS]);
 
 	if (player->playlist.front) {
 		
@@ -654,8 +653,9 @@ void PlaylistPlayer_get_frames(PlaylistPlayer *player, unsigned char *const stre
 	//This cannot be done in a totally straightforward way,
 	//since currently the logic assumes that it gets called at least every time that
 	//the phase or the playlist is changed.
-	if (!TrackPlayIdentifier_compatible_with(player->currentTrack.track, &player->playlist.front->track)
-		|| player->playlist.dirty) {
+	if (!TrackPlayIdentifier_compatible_with(player->currentTrack.track, player->playlist.front ? &player->playlist.front->track : 0)
+	    || player->playlist.dirty)
+	{
 		switch (player->state.phase) {
 		case PAUSING:
 			//Don't need to do anything.
@@ -973,14 +973,14 @@ void PlaylistPlayer_get_frames(PlaylistPlayer *player, unsigned char *const stre
 	#endif
 
 }
-void PlaylistPlayer_pause(PlaylistPlayer *player) {
+static void PlaylistPlayer_pause(PlaylistPlayer *player) {
 	//TODO, maybe abstract this, so the design isn't so fragile. (?)
 	player->state.want_silence = true;
 	if (player->state.phase != SILENCE) {
 		player->state.phase = PAUSING;
 	}
 }
-void PlaylistPlayer_resume(PlaylistPlayer *player) {
+static void PlaylistPlayer_resume(PlaylistPlayer *player) {
 	//TODO, maybe abstract this, so the design isn't so fragile. (?)
 	player->state.want_silence = false;
 	if (player->state.phase != PLAYING && player->playlist.front) {
@@ -997,7 +997,7 @@ void delete_forwards_FileCacheNode(FileCacheNode *file) {
 }
 
 //Takes ownership of all elements of new_playlist. Empties new_playlist.
-void PlaylistPlayer_update_playlist(PlaylistPlayer *player, Playlist *new_playlist, CommandType updateOrReplace) {
+static void PlaylistPlayer_update_playlist(PlaylistPlayer *player, Playlist *new_playlist, CommandType updateOrReplace) {
 	assert(updateOrReplace == UpdatePlaylist || updateOrReplace == ReplacePlaylist);
 	if (updateOrReplace == ReplacePlaylist) {
 		player->playlist.dirty = true;
@@ -1383,14 +1383,14 @@ struct AudioDeviceManager {
 };
 #endif
 
-
-void file_loader() {
+#if 0
+staic void file_loader() {
 	//TODO
 
 }
+#endif
 
-
-void delete_forwards_Command(struct Command *command) {
+static void delete_forwards_Command(struct Command *command) {
 	while (command) {
 		struct Command *next_command = command->next;
 		free_command(command);
@@ -1398,7 +1398,7 @@ void delete_forwards_Command(struct Command *command) {
 	}
 }
 
-int init_command_queue(CommandQueue *commandQueue) {
+static int init_command_queue(CommandQueue *commandQueue) {
 	//SDL_mutex *mutex = SDL_CreateMutex();//TODO re-add
 	//if (!mutex) return 1;
 	//commandQueue->mutex = mutex;
@@ -1407,7 +1407,7 @@ int init_command_queue(CommandQueue *commandQueue) {
 	return 0;
 }
 
-void free_command_queue(CommandQueue *commandQueue) {
+static void free_command_queue(CommandQueue *commandQueue) {
 	if (commandQueue->front) {
 		delete_forwards_Command(commandQueue->front);
 	}
@@ -1504,10 +1504,11 @@ void free_command_queue(CommandQueue *commandQueue) {
 //   Same as Internal Programming bug
 //   Add security controls (we probably won't do this, as we don't have any projected threats in the current setup)
 //   Make the API hard to misuse.
-
-bool has_terminating_newline(char const *line, size_t len) {
+#if 0
+static bool has_terminating_newline(char const *line, size_t len) {
 	return len != 0 && line[len-1] == '\n';
 }
+#endif
 /*
 struct InputCallbackData {
 	struct AudioCallbackData *audioCallback;
@@ -1606,6 +1607,7 @@ static int set_hwparams(
 	}
 	/* set the buffer time */
 	err = snd_pcm_hw_params_set_buffer_time_near(handle, params, &buffer_time, &dir);
+	printf("buffer_time: %d\n", buffer_time);
 	if (err < 0) {
 		printf("Unable to set buffer time %i for playback: %s\n", buffer_time, snd_strerror(err));
 		return err;
@@ -1618,6 +1620,7 @@ static int set_hwparams(
 	buffer_size = size;
 	/* set the period time */
 	err = snd_pcm_hw_params_set_period_time_near(handle, params, &period_time, &dir);
+	printf("period_time: %d\n", period_time);
 	if (err < 0) {
 		printf("Unable to set period time %i for playback: %s\n", period_time, snd_strerror(err));
 		return err;
@@ -1675,21 +1678,23 @@ static int set_swparams(snd_pcm_t *handle, snd_pcm_sw_params_t *swparams)
 	}
 	return 0;
 }
+#if 0
 /*
  *   Underrun and suspend recovery
  */
 static int xrun_recovery(snd_pcm_t *handle, int err)
 {
-	if (verbose)
-		printf("stream recovery\n");
+	//if (verbose)
+	//	printf("stream recovery\n");
 	if (err == -EPIPE) {    /* under-run */
 		err = snd_pcm_prepare(handle);
-		if (err < 0)
+		if (err < 0) {
 			printf("Can't recovery from underrun, prepare failed: %s\n", snd_strerror(err));
+		}
 		return 0;
-	} else if (err == -ESTRPIPE) {
+	} else if (err == -ESTRPIPE) { /*Suspended (?)*/
 		while ((err = snd_pcm_resume(handle)) == -EAGAIN)
-			sleep(1);   /* wait until the suspend flag is released */
+			sleep(1);   /* wait until the suspend flag is released *///TODO: Don't block other tasks!!!
 		if (err < 0) {
 			err = snd_pcm_prepare(handle);
 			if (err < 0)
@@ -1699,18 +1704,21 @@ static int xrun_recovery(snd_pcm_t *handle, int err)
 	}
 	return err;
 }
+#endif
+#if 0
 struct InputReadData {
 	//void *ud;
 	//command_read_callback command_callback; //= command_was_read
 	struct CommandParser *command_parser;
 };
-void inputReadCallback(char const *in_buf, size_t in_buf_size, void *ud) {
+static void inputReadCallback(char const *in_buf, size_t in_buf_size, void *ud) {
 	struct InputReadData *userData = ud;
 	if (CommandParser_execute(userData->command_parser, in_buf, in_buf_size/*, userData->command_callback, userData->ud*/) != 0) {
 		assert(false && "Error parsing input");//TODO
 	}
 }
-
+#endif
+#if 0
 struct StdInManager {
 	void *ud; /*= struct InputReadData {
 		void *ud;
@@ -1729,7 +1737,7 @@ struct StdInManager {
 	int inputfd;
 };
 
-void StdInManager_read(struct StdInManager *manager) {
+static void StdInManager_read(struct StdInManager *manager) {
 	char input_data[256];
 	ssize_t bytes_read = read(manager->inputfd, input_data, sizeof input_data);
 	if (bytes_read == -1) {
@@ -1767,6 +1775,7 @@ void StdInManager_read(struct StdInManager *manager) {
 	}
 #endif
 }
+#endif
 #if 0
 void StdInManager_init(struct StdInManager *manager, void (*inputCallback)(size_t in_line_size, char const *in_line, void *ud), void *ud) {
 	manager->ud = ud;
@@ -1781,17 +1790,18 @@ void StdInManager_init(struct StdInManager *manager, void (*inputCallback)(size_
 	manager->inputfd = inputfd;
 }
 #endif
-
-void StdInManager_init(struct StdInManager *manager, void (*readCallback)(char const *in_buf, size_t in_buf_size, void *ud), void *ud) {
+#if 0
+static void StdInManager_init(struct StdInManager *manager, void (*readCallback)(char const *in_buf, size_t in_buf_size, void *ud), void *ud) {
 	manager->ud = ud;
 	manager->readCallback = readCallback;
 	manager->inputfd = inputfd;
 }
 
-void StdInManager_fill_pollfd(struct StdInManager *manager, struct pollfd *ufd) {
+static void StdInManager_fill_pollfd(struct StdInManager *manager, struct pollfd *ufd) {
 	ufd->fd = manager->inputfd;
 	ufd->events = POLLIN;//= (struct pollfd){.fd = manager->stdinfd, .events = POLLIN, .revents = 0};
 }
+#endif
 #if 0
 struct SocketInManager {
 	void *ud;
@@ -1802,7 +1812,7 @@ struct CommandReadData {
 	struct AudioCallbackData *audioCallback;
 	//OutputBuffer outBuffer;
 };
-int command_was_read(struct Command *command, void *ud) {
+static int command_was_read(struct Command *command, void *ud) {
 	//Push command into command queue
 	//Or error?
 	struct CommandReadData *data = ud;
@@ -1845,13 +1855,570 @@ int command_was_read(struct Command *command, void *ud) {
 	}
 	return 0;
 }
+#if 0
+//Should probably use a more sophisticated scheme for output-rate matching.
+//(e.g. have the writer gradually send the data, internally managing how far through the data it is,
+// rather than sending the data all at once and using the buffer to perform the rate matching).
+struct RingBuffer{
+	char *buf;
+	size_t len;
+	size_t startPos;//Read Point
+	size_t endPos;  //Write Point
+	
+	//To add data, copy into ring if ring size allows, otherwise increase ring size.
+	
+	int write(char *data, size_t len) {
+		memcpy(data, endPos);
+		endPos += len;
+	}
+	
+	void get_data() {
+		return buf[startPos], startPos - endPos;//Modulo details about ringbuffering
+	}
+	void data_read(int nChars) {
+		startPos+=nChars;//Modulo details about ringbuffering
+	}
+};
+#endif
+struct ConnectionData {
+	struct CommandParser *parser;
+	//bool hasPendingOutput; //Virtual field, obtained from within parserState.(?)
+	int connection_fd;
+};
 
-static int poll_and_dispatch_events(struct pollfd *ufds, int num_pcm_descriptors, struct StdInManager *stdin_manager, bool *init, snd_pcm_t *handle) {
+static void ConnectionData_free(struct ConnectionData *connection) {
+	while (close(connection->connection_fd) == -1) {
+		switch (errno) {
+			default:
+			case EBADFD:
+				assert(false && "connection->connection_fd must be valid at this point");
+				goto end;
+			case EINTR:
+				continue;
+			case EIO:
+				printf("IO error when closing connection->connection_fd\n");
+				goto end; //TODO: Figure out how to properly handle this.
+		}
+	}
+	end:;
+	delete_CommandParser(connection->parser);
+}
+
+struct SocketManager {
+	//Socket fd
+	//List of Connections {
+	//	Parser
+	//	OutBuffer?
+	//	connection_fd
+	//}
+	
+	int socket_fd;
+	
+	struct ConnectionData *connections;
+	size_t connections_len;
+	size_t connections_capacity;
+	
+	command_read_callback command_read_callback;
+	void *command_read_callback_ud;
+	//Init
+	//Destroy
+	
+	//HandleSocketRevent
+	//GetSocketFD
+	//GetConnectionFDs
+	//HandleConnectionRevent
+};
+
+static int init_CommandServerSocket() {
+	//Create and Bind socket.
+	//Begin listening later, once we are ready to handle connections.
+	int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (socket_fd < 0) return socket_fd;
+	struct sockaddr_in server;
+	server.sin_family = AF_INET;
+	server.sin_addr.s_addr = INADDR_ANY;
+	server.sin_port = htons(9898);
+	//Bind
+	if(bind(socket_fd, (struct sockaddr*)&server , sizeof(server)) < 0)
+	{
+		//print the error message
+		printf("Couldn't bind CommandServerSocket.");
+		return -1;
+	}
+	return socket_fd;
+}
+
+//socket_fd must be a streaming socket server.
+static int SocketManager_init(struct SocketManager *manager, int socket_fd, command_read_callback command_read_callback, void *command_read_callback_ud) {
+	int flags = fcntl(socket_fd, F_GETFL);
+	if (flags == -1) return -1;
+	int ret = fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK);
+	assert(ret == 0 && "fcntl should always return 0 when performing the F_SETFL operation");
+	manager->socket_fd = socket_fd;
+	
+	manager->connections = 0;
+	manager->connections_len = 0;
+	manager->connections_capacity = 0;
+	
+	manager->command_read_callback = command_read_callback;
+	manager->command_read_callback_ud = command_read_callback_ud;
+
+	return 0;
+}
+
+static void SocketManager_free(struct SocketManager *manager) {
+	//TODO Destroy each connection, before freeing the array.
+	for (size_t i = 0; i != manager->connections_len; ++i) {
+		ConnectionData_free(&manager->connections[i]);
+	}
+	free(manager->connections);
+}
+
+static int SocketManager_start(struct SocketManager *manager) {
+	int flags = fcntl(manager->socket_fd, F_GETFL);
+	if (flags == -1) return flags;
+	assert(flags & O_NONBLOCK);
+	return listen(manager->socket_fd, 512);
+}
+static void SocketManager_fill_socket_poll_descriptor(struct SocketManager *manager, struct pollfd *descriptor) {
+	assert(manager->socket_fd >= 0);
+	descriptor->fd = manager->socket_fd;
+	descriptor->events = POLLIN;
+}
+
+static size_t SocketManager_getNumConnections(struct SocketManager *manager) {
+	return manager->connections_len;
+}
+
+static void SocketManager_fill_connections_poll_descriptors(struct SocketManager *manager, struct pollfd *descriptors) {
+	for (size_t i = 0; i != manager->connections_len; ++i) {
+		descriptors[i] = (struct pollfd) {
+			.fd = manager->connections[i].connection_fd,
+			.events = POLLIN, //TODO: Handle POLLOUT too when the CommandParser has output to send.
+			.revents = 0,
+		};
+	}
+#if 0
+	descriptors[0] = (struct pollfd){
+		.fd = fileno(stdin),
+		.events = POLLIN,
+		.revents = 0,
+	};
+	//Should only listen for POLLOUT if there is buffered output data.
+	descriptors[1] = (struct pollfd){
+		.fd = fileno(stdout),
+		.events = POLLOUT,
+		.revents = 0,
+	};
+#endif
+	//assert(false);
+}
+static int SocketManager_handleSocketRevent(struct SocketManager *manager, int revents) {
+	//TODO: Handle connections becoming closed.
+	if (revents & POLLERR) {
+		assert(false && "input socket got POLLERR");//TODO: fix error handling.
+		return -1;
+	}
+	if (revents & POLLOUT) {
+		assert(false &&  "input socket got POLLOUT");//TODO: fix error handling.
+		return -1;
+	}
+	if (revents & POLLIN) {
+		int newConnection_fd = accept(manager->socket_fd, 0, 0);
+		if (newConnection_fd < 0) {
+			printf("Connection Failed\n");
+			return -1;
+		}
+		else {
+			printf("Got Connection\n");
+			//close(newConnection_fd);
+			//push_back connection:
+			if (manager->connections_len == manager->connections_capacity) {
+				size_t newCapacity = manager->connections_capacity == 0 ? 1 : manager->connections_capacity*2;
+				struct ConnectionData *newConnections = realloc(manager->connections, newCapacity*sizeof *newConnections);
+				if (!newConnections) {
+					printf("Couldn't allocate memory for new connection\n");
+					return -1;
+				}
+				manager->connections = newConnections;
+				manager->connections_capacity = newCapacity;
+			}
+			
+			manager->connections[manager->connections_len].connection_fd = newConnection_fd;
+			manager->connections[manager->connections_len].parser = new_CommandParser(manager->command_read_callback, manager->command_read_callback_ud);
+			if (!manager->connections[manager->connections_len].parser) {
+				printf("Couldn't create parser for new connection\n");
+				return -1;
+			}
+			manager->connections_len++;
+			printf("New connection_fd == %d\n", manager->connections[manager->connections_len-1].connection_fd);
+		}
+	}
+	return 0;
+}
+//#if 0
+struct pcm_handler_data {
+	snd_pcm_t *pcm_handle;
+	bool pcm_underrun; //Underrun.
+	
+	struct AudioCallbackData *audioCallbackData;
+	
+	char *buf;
+	//size_t buf_capacity; //Allocated capacity of buf.
+	//size_t buf_size; //Amount of real data in buf.
+	//size_t buf_pos; //Current position within buf that we are reading from.
+};
+static int pcm_handler(unsigned short revents, void *ud) {
+	struct pcm_handler_data *userData = ud;
+	if (!revents) {return 0;}
+	if (revents & POLLERR) {
+		printf("pcm_handler POLLERR\n");
+		//We've stopped handling Suspended, since we don't know what causes it (and as far as we know, it might never be triggered in our system).
+		//We need to find out, and perhaps re-add. See pcm_try_recover.
+		if (snd_pcm_state(userData->pcm_handle) == SND_PCM_STATE_XRUN/* || snd_pcm_state(userData->pcm_handle) == SND_PCM_STATE_SUSPENDED*/)
+		{
+			//TODO: After underrun, perform soft-start again (that is, find zero-crossing in new data, since the output was forced to silence by the underrun).
+			userData->pcm_underrun = true;
+			return 0;
+			/*
+			err = snd_pcm_state(userData->pcm_handle) == SND_PCM_STATE_XRUN ? -EPIPE : -ESTRPIPE;
+			if (xrun_recovery(userData->pcm_handle, err) < 0) {
+				printf("Write error: %s\n", snd_strerror(err));
+				exit(EXIT_FAILURE);
+			}
+			*init = true;*/
+		}
+		else {
+			printf("Wait for poll failed\n");
+			return -1;
+		}
+	}
+	else if (revents & POLLIN) {
+		assert(false && "PCM incorrectly configured, should be an output PCM but got POLLIN event");
+		printf("PCM incorrectly configured\n");
+		return -1;
+	}
+	else if (revents & POLLOUT) {
+		//read avail frames into buf:
+		snd_pcm_sframes_t avail;
+		if ((avail = snd_pcm_avail_update(userData->pcm_handle)) < 0) {
+			printf("snd_pcm_avail_update failed!\n");
+			userData->pcm_underrun = true;
+			return 0;//TODO: Make this negative(?), properly handle when it is
+		}
+		//TODO: Properly handle possible integer overflow
+		size_t buf_len = avail * channels * snd_pcm_format_physical_width(format)/CHAR_BIT;
+		void *n_buf = realloc(userData->buf, buf_len);
+		if (!n_buf) {
+			printf("Couldn't allocate memory\n");
+			return -1;
+		}
+		userData->buf = n_buf;
+		//userData->buf_size = avail;
+		//userData->buf_pos = 0;
+		//Get data from callback.
+		//TODO: Make callback do soft-start after an underrun. 
+		AudioCallback(userData->audioCallbackData, (unsigned char*)userData->buf, buf_len);
+		//Write data to output.
+		int written = snd_pcm_writei(userData->pcm_handle, userData->buf, avail);
+		if (written < 0) {
+			//TODO more thorough error checking
+			
+			//We got an underrun.
+			//Set underrun flag to true
+			//discard buf(?) (i.e., skip a bit of the track)
+			// (This is controversial. Is it better to go silent and then come back where you were, or
+			//  to come back ~where you would have got to?)
+			userData->pcm_underrun = true;
+		}
+		else {
+			assert(written == avail && "This code assumes that it is always possible to write 'avail' frames worth of data. If this is not true, change the code.");
+		}
+		
+#if 0
+		///The ALSA example code seems to think that avail = snd_pcm_avail_update followed by written = snd_pcm_writei(avail) might not always lead to written==avail.
+		///I'd like to see that happen before adopting the more complicated version below.
+		if (buf_pos == buf_size) {
+			//snd_pcm_sframes_t avail = snd_pcm_avail_update(handle);
+			//read avail frames into buf,
+			//buf_size = avail;
+			//buf_pos = 0;
+			AudioCallback(&callbackData, (unsigned char*)buf, avail * channels * snd_pcm_format_physical_width(format)/CHAR_BIT);
+			
+		}
+		if (buf_pos < buf_size) {
+			//Write from buf
+			
+			int frames_written = snd_pcm_writei(handle, ptr, cptr);
+			if (frames_written < 0) {
+				userData->pcm_underrun = true;
+				
+				/*
+				if (xrun_recovery(handle, err) < 0) {
+					printf("Write error: %s\n", snd_strerror(err));
+					exit(EXIT_FAILURE);
+				}
+				init = true;
+				break;*/  /* skip one period */
+			}
+			
+		}
+#endif
+	}
+	return 0;
+}
+//#endif
+//#if 0
+static int pcm_try_recover(snd_pcm_t *pcm_handle) {
+	//if (verbose)
+	//	printf("stream recovery\n");
+	/*
+	 * TODO: For the 'illegal states', ensure that they actually can't occur, and/or figure out the conditions where
+	 *       they will occur and the correct responses to those conditions.
+	 * 
+	 * SND_PCM_STATE_OPEN         Open                                                            Illegal state, should have already started pcm before calling pcm_try_recover.
+	 * SND_PCM_STATE_SETUP        Setup installed                                                 Illegal state, should have already started pcm before calling pcm_try_recover.
+	 * SND_PCM_STATE_PREPARED     Ready to start                                                  Illegal state, should have already started pcm before calling pcm_try_recover.
+	 * SND_PCM_STATE_RUNNING      Running                                                         Do nothing. Problem has resolved itself.
+	 * SND_PCM_STATE_XRUN         Stopped: underrun (playback) or overrun (capture) detected      snd_pcm_prepare();
+	 * SND_PCM_STATE_DRAINING     Draining: running (playback) or stopped (capture)               Illegal state(?), we never want to call drain on the pcm
+	 * SND_PCM_STATE_PAUSED       Paused                                                          Illegal state(?), we never want to call 'pause' on the pcm
+	 * SND_PCM_STATE_SUSPENDED    Hardware is suspended                                           Illegal state(?), we never want to call 'suspend' on the pcm
+	 * SND_PCM_STATE_DISCONNECTED Hardware is disconnected                                        Need to find a new output stream. TODO: requires rearchitecture of output system.
+	 */
+	
+	printf("Attempting Underrun Recovery\n");
+	snd_pcm_state_t pcm_state = snd_pcm_state(pcm_handle);
+	switch (pcm_state) {
+		case SND_PCM_STATE_XRUN:{
+			int err = snd_pcm_prepare(pcm_handle);
+			if (err < 0) {
+				printf("Underrun recovery failed: %s\n", snd_strerror(err));
+				return -1;
+			}
+			break;
+		}
+		//case SND_PCM_STATE_SUSPENDED: //For now, let's not handle suspension. I don't even know what it is or what could trigger it.
+		//	snd_pcm_resume(), snd_pcm_prepare(); //The example code does this, looping on snd_pcm_resume until it succeeds.
+		case SND_PCM_STATE_RUNNING:{
+			//do nothing
+
+			break;
+		}
+		default:{
+			printf("PCM Recovery failed. Illegal state: %d\n", pcm_state);
+			break;
+		}
+	}
+	printf("Underrun Recovery Complete\n");
+	return 0;
+#if 0
+	if (err == -EPIPE) {    /* under-run */
+		err = snd_pcm_prepare(handle);
+		if (err < 0) {
+			printf("Can't recovery from underrun, prepare failed: %s\n", snd_strerror(err));
+		}
+		return 0;
+	} else if (err == -ESTRPIPE) { /*Suspended (?)*/
+		while ((err = snd_pcm_resume(handle)) == -EAGAIN)
+			sleep(1);   /* wait until the suspend flag is released *///TODO: Don't block other tasks!!!
+		if (err < 0) {
+			err = snd_pcm_prepare(handle);
+			if (err < 0)
+				printf("Can't recovery from suspend, prepare failed: %s\n", snd_strerror(err));
+		}
+		return 0;
+	}
+	return err;
+#endif
+}
+
+static int connections_handler(short *revents, size_t num, void *ud) {
+	struct SocketManager *socket_manager = ud;
+	for (size_t i = 0; i != num; ++i) {
+		if (revents[i] & POLLERR) {
+			//TODO: Close the connection or something?
+			continue;
+		}
+		if (revents[i] & POLLIN) {
+			char input_data[256];
+			ssize_t bytes_read = read(socket_manager->connections[i].connection_fd, input_data, sizeof input_data);
+			if (bytes_read == -1) {
+				printf("Error reading from socket\n");
+				//TODO: Close the connection or something?
+				continue;
+			}
+			if (CommandParser_execute(socket_manager->connections[i].parser, input_data, (size_t)bytes_read) < 0) {
+				//TODO: Close the connection or something?
+				printf("Command Parser error on connection #%zu\n", i);
+			}
+		}
+		if (revents[i] & POLLOUT) {
+			//TODO: Send buffered replies, if any.
+			continue;
+		}
+	}
+	return 0;
+#if 0
+	assert(num == 1);
+	if (revents[0] & POLLERR) {
+		printf("Error reading stdin\n");
+		return -1;
+	}
+	if (revents[0] & POLLOUT) {
+		printf("stdin incorrectly configured, producing output events.");
+		return -1;
+	}
+	if (revents[0] & POLLIN) {
+		StdInManager_read(ud);
+	}
+	return 0;
+#endif
+}
+struct socket_handler_data {
+	struct SocketManager *socket_manager;
+};
+static int socket_handler(short revent, void *ud) {
+	//(void)revent; (void)ud;
+	return SocketManager_handleSocketRevent(((struct socket_handler_data*)ud)->socket_manager, revent);
+}
+
+//#endif
+//#if 0
+static int poll_and_dispatch_events_v2(
+	int (*pcm_handler)(unsigned short revents, void *ud),
+	void *pcm_handler_ud,
+	int (*connections_handler)(short *revents, size_t num, void *ud),
+	void *connections_handler_ud,
+	int (*socket_handler)(short revent, void *ud),
+	void *socket_handler_ud,
+	struct pollfd *pcm_pollfds,
+	size_t pcm_pollfds_len,
+	struct pollfd *connections_pollfds,
+	size_t connections_pollfds_len,
+	struct pollfd *socket_pollfd,
+	snd_pcm_t *pcm_handle)
+{
+	//TODO: Poll for output as well.
+	//      Update command_parser to send output to an output buffer
+	//      and send the output when POLLOUT events arrive.
+	
+	//printf("poll_and_dispatch_events_v2\n");
+	int err = 0;
+	/*
+	pollfds = concat(pcm_pollfds, socket_pollfd, connections_pollfds);
+	poll(pollfds);
+	demangled_pcm = demangle_pcm(pcm_pollfds);
+	pcm_handler(demangled_pcm);
+	//Handle connections before the socket, since the socket_handler could alter the list of connections.
+	connections_handler(connections_pollfds);
+	socket_handler(socket_pollfd);
+	*/
+	size_t num_pollfds = pcm_pollfds_len+connections_pollfds_len+1;
+	struct pollfd *pollfds = calloc(num_pollfds, sizeof *pollfds);
+	if (num_pollfds > 0 && !pollfds) return -1;
+	//Explicitly handle 0 size allocation to keep clang analyzer happy.
+	short *connections_revents = connections_pollfds_len > 0 ? calloc(connections_pollfds_len, sizeof *connections_revents) : 0;
+	if (connections_pollfds_len > 0 && !connections_revents) {
+		err = -1;
+		goto end;
+	}
+	size_t first_pcm_pollfd = 0;
+	size_t first_connections_pollfd = first_pcm_pollfd+pcm_pollfds_len;
+	size_t first_socket_pollfd = first_connections_pollfd+connections_pollfds_len;
+	if (pcm_pollfds_len > 0) {
+		memcpy(pollfds+first_pcm_pollfd, pcm_pollfds, pcm_pollfds_len*sizeof *pcm_pollfds);
+	}
+	if (connections_pollfds_len > 0) {
+		memcpy(pollfds+first_connections_pollfd, connections_pollfds, connections_pollfds_len*sizeof *connections_pollfds);
+	}
+	memcpy(pollfds+first_socket_pollfd, socket_pollfd, sizeof *socket_pollfd);
+	
+	//Repoll 5 times per second.
+	//Using explicit timeout to handle the case where
+	//the pcm is suspended and we need to repeatedly call
+	//snd_pcm_resume.
+	//Don't just do this in pcm_handler, since POLLERR will be continuously generated
+	//and would use excessive CPU (I think?).
+	//Instead, remove pcm_pollfds from the poll list until the pcm_handle has recovered,
+	//and call snd_pcm_resume separately.
+	if (poll(pollfds, num_pollfds, 200) < 0) {//TODO: Not all <0 return values from poll indicate fatal errors, should update the error checking.
+		err = -1;
+		printf("Poll failed");
+		goto end;
+	}
+	//printf("Got Events\n");
+
+	
+	//If no pcm_pollfds, the pcm must be in a suspended state.
+	//Need to have a relatively short timeout on the poll() call, to also call snd_pcm_resume in the top level loop.
+	//
+	if (pcm_pollfds) {
+		//Just to be different, ALSA uses unsigned short for revents, even though
+		//poll uses short.
+		unsigned short pcm_revents = 0;
+		err = snd_pcm_poll_descriptors_revents(pcm_handle, pollfds+first_pcm_pollfd, (unsigned)pcm_pollfds_len, &pcm_revents);
+		if (err < 0) {
+			printf("snd_pcm_poll_descriptors_revents failed!\n");
+			goto end;
+		}
+		if (pcm_handler(pcm_revents, pcm_handler_ud) < 0) {
+			printf("pcm_handler failed!\n");
+			err = -1;
+			goto end;
+		}
+	}
+	else {
+		printf("no pcm_pollfds\n");
+	}
+	for (size_t i = 0; i != connections_pollfds_len; ++i) {
+		connections_revents[i] = (pollfds+first_connections_pollfd)[i].revents;
+	}
+	//connections_handler MUST be called before socket_handler, since socket_handler
+	//could modify the list of active connections.
+	if (connections_handler(connections_revents, connections_pollfds_len, connections_handler_ud) < 0) {
+		err = -1;
+		goto end;
+	}
+	if (socket_handler((pollfds+first_socket_pollfd)->revents, socket_handler_ud) < 0) {
+		err = -1;
+		goto end;
+	}
+	
+	end:;
+	free(connections_revents);
+	free(pollfds);//TODO?:Cache these lists, avoid unnecessary dynamic memory activity
+	return err;
+}
+//#endif
+#if 0
+static int poll_and_dispatch_events(
+	struct pollfd *pcm_ufds,
+	int num_pcm_descriptors,
+	struct pollfd *stdin_pollfd,
+	struct pollfd *server_pollfd,
+	struct StdInManager *stdin_manager,
+	struct SocketManager *socket_manager,
+	bool *init,
+	snd_pcm_t *handle)
+{
+	struct pollfd *ufds = malloc((num_pcm_descriptors+2)*sizeof *ufds);
+	if (!ufds) return -1;
+	
+	for (int i = 0; i != num_pcm_descriptors; ++i) {
+		ufds[i] = pcm_ufds[i];
+	}
+	ufds[num_pcm_descriptors+0] = *stdin_pollfd;
+	ufds[num_pcm_descriptors+1] = *server_pollfd;
+	int num_pollfds = num_pcm_descriptors+2;
+	
 	int err = 0;
 	unsigned short revents = 0;
 	bool gotEvent = false;
 	while (!gotEvent) {
-		poll(ufds, num_pcm_descriptors+1, -1);
+		//TODO: Also wait for SIGTERM, and
+		//cleanly shut down if it is received.
+		poll(ufds, num_pollfds, -1);
 		snd_pcm_poll_descriptors_revents(handle, ufds, num_pcm_descriptors, &revents);
 		if (revents & POLLERR) {
 			err = -EIO;
@@ -1862,10 +2429,10 @@ static int poll_and_dispatch_events(struct pollfd *ufds, int num_pcm_descriptors
 					printf("Write error: %s\n", snd_strerror(err));
 					exit(EXIT_FAILURE);
 				}
-				*init = 1;
+				*init = true;
 			} else {
 				printf("Wait for poll failed\n");
-				return err;
+				goto end;
 			}
 			gotEvent = true;
 		}
@@ -1873,14 +2440,15 @@ static int poll_and_dispatch_events(struct pollfd *ufds, int num_pcm_descriptors
 			err = 0;
 			gotEvent = true;
 		}
-		if (ufds[num_pcm_descriptors].revents & POLLERR) {
+		if (ufds[num_pcm_descriptors+0].revents & POLLERR) {
 			fprintf(stderr, "Error reading stdin\n");
 			exit(-1);
 		}
-		if (ufds[num_pcm_descriptors].revents & POLLIN) {
+		if (ufds[num_pcm_descriptors+0].revents & POLLIN) {
 			StdInManager_read(stdin_manager);
 			//gotEvent = true;
 		}
+		SocketManager_handleSocketRevent(socket_manager, &ufds[num_pcm_descriptors+1]);
 		/*
 		 * for (int i = 0; i < num_in_connections; ++i) {
 		 *     if(ufds[first_in_connection+i].revents & POLLIN) {
@@ -1890,10 +2458,160 @@ static int poll_and_dispatch_events(struct pollfd *ufds, int num_pcm_descriptors
 		 * 
 		 */
 	}
+	end:;
+	free(ufds);
 	return err;
 }
-
-static int write_and_poll_loop(snd_pcm_t *handle)
+#endif
+//#if 0
+static int write_and_poll_loop_v2(snd_pcm_t *pcm_handle, int control_server_socket_fd) {
+	int err = 0;
+	//TODO: Design+Implement error recovery scheme (especially for all the callbacks).
+	//TODO; Perhaps make the halt-command separate? (Rationale:
+	// - Normal operation shouldn't be able to cause the system to quit, this should be a separate channel.
+	// - When a halt command is received, the system shuts down and everything stops (and in particular, future commands are ignored),
+	//   this is a fundamentally different behaviour from all the other commands).
+	
+	//TODO: Fix structure of deallocation handling when initialisation fails halfway through.
+	//      Perhaps put allocation/deallocation in a separate function that can succeed or fail as
+	//      an atomic unit.
+	struct AudioCallbackData callbackData;
+	if (init_command_queue(&callbackData.commandQueue) < 0) {
+		printf("Couldn't init command_queue\n");
+		err = -1;
+		goto end_end;
+	}
+	init_PlaylistPlayer(&callbackData.player); //TODO: Error handling for init_PlaylistPlayer
+	callbackData.halt_command = 0;
+	
+	struct CommandReadData commandReadData = (struct CommandReadData){
+		.audioCallback = &callbackData
+	};
+	
+	struct pcm_handler_data pcm_handler_data = (struct pcm_handler_data){
+		.pcm_handle = pcm_handle,
+	    .pcm_underrun = false,
+	    .audioCallbackData = &callbackData,
+		.buf = 0
+	};
+	{
+	struct SocketManager socket_manager;
+	if (SocketManager_init(&socket_manager, control_server_socket_fd, command_was_read, &commandReadData) != 0) {
+		printf("Couldn't init SocketManager\n");
+		err = -1;
+		goto end_pcm_handler_data;
+	}
+	
+	{
+	struct pollfd *pcm_pollfds;
+	int pcm_pollfds_len = snd_pcm_poll_descriptors_count(pcm_handle);
+	//printf("Num pcm_descriptors: %d\n", pcm_pollfds_len);
+	if (pcm_pollfds_len <= 0) {
+		printf("Invalid snd_pcm_poll_descriptors_count\n");
+		err = pcm_pollfds_len;
+		goto end_SocketManager;
+	}
+	pcm_pollfds = malloc(sizeof(struct pollfd) * (size_t)pcm_pollfds_len);
+	if (!pcm_pollfds) {
+		printf("No enough memory\n");
+		err = -ENOMEM;
+		goto end_SocketManager;
+	}
+	if ((err = snd_pcm_poll_descriptors(pcm_handle, pcm_pollfds, (unsigned int)pcm_pollfds_len)) < 0) {
+		printf("Unable to obtain poll descriptors for playback: %s\n", snd_strerror(err));
+		err = -1;
+		goto end_pcm_pollfds;
+	}
+	struct pollfd server_pollfd;
+	SocketManager_fill_socket_poll_descriptor(&socket_manager, &server_pollfd);
+#if 0
+	for (int i=0;i!=pcm_pollfds_len;++i) {
+		EventManager_add(pcm_pollfds[i]);
+	}
+#endif
+	if (SocketManager_start(&socket_manager) != 0) {
+		printf("Couldn't start control server\n");
+		err = -1;
+		goto end_pcm_pollfds;
+	}
+	{
+	struct pollfd *connections_pollfds = 0;
+	while (!(callbackData.halt_command && callbackData.halt_command->data.done.done)) {
+		size_t connections_pollfds_len = SocketManager_getNumConnections(&socket_manager);
+		//TODO: Integer overflow handling.
+		//printf("connections_pollfds_len: %uld\n", connections_pollfds_len);
+		if (connections_pollfds_len > 0) {
+			struct pollfd *new_connections_pollfds = realloc(connections_pollfds, connections_pollfds_len * sizeof *connections_pollfds);
+			if (connections_pollfds_len != 0 && !new_connections_pollfds) {
+				printf("Couldn't allocate memory for socket connection's pollfds\n");
+				err = -1;
+				goto end_all;
+			}
+			connections_pollfds = new_connections_pollfds;
+		}
+		SocketManager_fill_connections_poll_descriptors(&socket_manager, connections_pollfds);
+		if (pcm_handler_data.pcm_underrun) {
+			if (pcm_try_recover(pcm_handle) < 0) {
+				printf("PCM recovery failed");
+				err = -1;
+				goto end_all;
+			}
+			pcm_handler_data.pcm_underrun = false;
+		}
+#if 0
+	static int poll_and_dispatch_events_v2(
+		int (*pcm_handler)(unsigned short revents, void *ud),
+		void *pcm_handler_ud,
+		int (*connections_handler)(short *revents, size_t num, void *ud),
+		void *connections_handler_ud,
+		int (*socket_handler)(short revent, void *ud),
+		void *socket_handler_ud,
+		struct pollfd *pcm_pollfds,
+		size_t pcm_pollfds_len,
+		struct pollfd *connections_pollfds,
+		size_t connections_pollfds_len,
+		struct pollfd *socket_pollfd,
+		snd_pcm_t *pcm_handle)
+#endif
+		if (poll_and_dispatch_events_v2(
+		    	pcm_handler, &pcm_handler_data,
+		    	connections_handler, &socket_manager,
+		    	socket_handler, &(struct socket_handler_data){.socket_manager = &socket_manager},
+		    	pcm_handler_data.pcm_underrun ? 0 : pcm_pollfds, (size_t)(pcm_handler_data.pcm_underrun ? 0 : pcm_pollfds_len),
+		    	connections_pollfds, connections_pollfds_len,
+		    	&server_pollfd,
+		    	pcm_handle)
+		  < 0)
+		{
+			printf("poll_and_dispatch_events_v2 failed!\n");
+			err = -1;
+			goto end_all;
+		}
+	}
+	end_all:;
+	//end_connections_pollfds:;
+	free(connections_pollfds);
+	}
+	end_pcm_pollfds:;
+	free(pcm_pollfds);
+	}
+	end_SocketManager:;
+	SocketManager_free(&socket_manager);
+	}
+	end_pcm_handler_data:;
+	free(pcm_handler_data.buf);
+	
+	free_command(callbackData.halt_command);
+	//end_PlaylistPlayer:;
+	free_PlaylistPlayer(&callbackData.player);
+	//end_command_queue:;
+	free_command_queue(&callbackData.commandQueue);
+	end_end:;
+	return err;
+}
+//#endif
+#if 0
+static int write_and_poll_loop(snd_pcm_t *handle, int control_server_socket_fd)
 {
 	//TODO: Design+Implement error recovery scheme (especially for all the callbacks).
 	//TODO; Perhaps make the halt-command separate? (Rationale:
@@ -1912,7 +2630,7 @@ static int write_and_poll_loop(snd_pcm_t *handle)
 	struct CommandParser *parser = new_CommandParser(command_was_read, &commandReadData);
 	if (!parser) {
 		printf("Couldn't allocate command parser");//TODO Proper error handling
-		exit(-1);
+		return -1;
 	}
 	
 	//struct InputCallbackData inputCallback = (struct InputCallbackData){.audioCallback = &callbackData};
@@ -1955,15 +2673,28 @@ static int write_and_poll_loop(snd_pcm_t *handle)
 	//InConnectionManager_init(&in_connection_manager, socketfd);//TODO
 	
 	//int in_connection_poll_descriptors = InConnectionManager_poll_descriptors_count(&in_connection_manager);
+#if 0
+	struct EventManager ev_manager;
+	
+#endif
+	struct SocketManager socket_manager;
+	if (SocketManager_init(&socket_manager, control_server_socket_fd) != 0) {
+		return -1;
+	}
 	
 	struct StdInManager stdin_manager;
 	StdInManager_init(&stdin_manager, &inputReadCallback, &inputReadData);
 
 	struct pollfd *ufds;
+	
+	struct pollfd stdin_pollfd;
+	struct pollfd server_pollfd;
+	
 	signed short *ptr;
 	int err, num_pcm_descriptors, cptr;
 	bool init = false;
 	num_pcm_descriptors = snd_pcm_poll_descriptors_count(handle);
+	printf("Num pcm_descriptors: %d\n", num_pcm_descriptors);
 	if (num_pcm_descriptors <= 0) {
 		printf("Invalid snd_pcm_poll_descriptors_count\n");
 		return num_pcm_descriptors;
@@ -1971,7 +2702,7 @@ static int write_and_poll_loop(snd_pcm_t *handle)
 	//int num_poll_descriptors = num_pcm_descriptors+1; //pcm+socket.
 	                                    //As connections occur on the socket, more
 	                                    //file descriptors will be added to the list.
-	ufds = malloc(sizeof(struct pollfd) * (num_pcm_descriptors+1));
+	ufds = malloc(sizeof(struct pollfd) * num_pcm_descriptors);
 	if (ufds == NULL) {
 		printf("No enough memory\n");
 		return -ENOMEM;
@@ -1980,49 +2711,21 @@ static int write_and_poll_loop(snd_pcm_t *handle)
 		printf("Unable to obtain poll descriptors for playback: %s\n", snd_strerror(err));
 		return err;
 	}
-	StdInManager_fill_pollfd(&stdin_manager, &ufds[num_pcm_descriptors]);
-	init = 1;
+	StdInManager_fill_pollfd(&stdin_manager, &stdin_pollfd);
+	SocketManager_fill_socket_poll_descriptor(&socket_manager, &server_pollfd);
+#if 0
+	for (int i=0;i!=num_pcm_descriptors;++i) {
+		EventManager_add(ufds[i]);
+	}
+#endif
+	if (SocketManager_start(&socket_manager) != 0) {
+		printf("Couldn't start control server\n");
+		return -1;
+	}
+	init = true;
 	while (!(callbackData.halt_command && callbackData.halt_command->data.done.done)) {
 		if (!init) {
-			poll_and_dispatch_events(ufds, num_pcm_descriptors, &stdin_manager, &init, handle);
-#if 0
-			{
-				unsigned short revents;
-				bool gotEvent = false;
-				while (!gotEvent) {
-					poll(ufds, num_pcm_descriptors+1, -1);
-					snd_pcm_poll_descriptors_revents(handle, ufds, num_pcm_descriptors, &revents);
-					if (revents & POLLERR) {
-						err = -EIO;
-						if (snd_pcm_state(handle) == SND_PCM_STATE_XRUN ||
-							snd_pcm_state(handle) == SND_PCM_STATE_SUSPENDED) {
-							err = snd_pcm_state(handle) == SND_PCM_STATE_XRUN ? -EPIPE : -ESTRPIPE;
-							if (xrun_recovery(handle, err) < 0) {
-								printf("Write error: %s\n", snd_strerror(err));
-								exit(EXIT_FAILURE);
-							}
-							init = 1;
-						} else {
-							printf("Wait for poll failed\n");
-							return err;
-						}
-						gotEvent = true;
-					}
-					if (revents & POLLOUT) {
-						err = 0;
-						gotEvent = true;
-					}
-					if (ufds[num_pcm_descriptors].revents & POLLERR) {
-						fprintf(stderr, "Error reading stdin\n");
-						exit(-1);
-					}
-					if (ufds[num_pcm_descriptors].revents & POLLIN) {
-						StdInManager_read(&stdin_manager);
-						//gotEvent = true;
-					}
-				}	
-			}
-#endif
+			poll_and_dispatch_events(ufds, num_pcm_descriptors, &stdin_pollfd, &server_pollfd, &stdin_manager, &socket_manager, &init, handle);
 		}
 		int avail = snd_pcm_avail_update(handle);
 		short * const buf = malloc(avail * channels * snd_pcm_format_physical_width(format)/CHAR_BIT);
@@ -2038,55 +2741,17 @@ static int write_and_poll_loop(snd_pcm_t *handle)
 					printf("Write error: %s\n", snd_strerror(err));
 					exit(EXIT_FAILURE);
 				}
-				init = 1;
+				init = true;
 				break;  /* skip one period */
 			}
-			if (snd_pcm_state(handle) == SND_PCM_STATE_RUNNING) init = 0;
+			if (snd_pcm_state(handle) == SND_PCM_STATE_RUNNING) init = false;
 			ptr += err * channels;
 			cptr -= err;
 			if (cptr == 0) break;
 			/* it is possible, that the initial buffer cannot store */
 			/* all data from the last period, so wait awhile */
 			//err = wait_for_poll(handle, ufds, num_pcm_descriptors);
-			poll_and_dispatch_events(ufds, num_pcm_descriptors, &stdin_manager, &init, handle);
-#if 0
-			{
-				unsigned short revents;
-				bool gotEvent = false;
-				while (!gotEvent) {
-					poll(ufds, num_pcm_descriptors+1, -1);
-					snd_pcm_poll_descriptors_revents(handle, ufds, num_pcm_descriptors, &revents);
-					if (revents & POLLERR) {
-						err = -EIO;
-							if (snd_pcm_state(handle) == SND_PCM_STATE_XRUN ||
-							snd_pcm_state(handle) == SND_PCM_STATE_SUSPENDED) {
-							err = snd_pcm_state(handle) == SND_PCM_STATE_XRUN ? -EPIPE : -ESTRPIPE;
-							if (xrun_recovery(handle, err) < 0) {
-								printf("Write error: %s\n", snd_strerror(err));
-								exit(EXIT_FAILURE);
-							}
-							init = 1;
-						} else {
-							printf("Wait for poll failed\n");
-							return err;
-						}
-						gotEvent = true;
-					}
-					if (revents & POLLOUT) {
-						err = 0;
-						gotEvent = true;
-					}
-					if (ufds[num_pcm_descriptors].revents & POLLERR) {
-						fprintf(stderr, "Error reading stdin\n");
-						exit(-1);
-					}
-					if (ufds[num_pcm_descriptors].revents & POLLIN) {
-						StdInManager_read(&stdin_manager);
-						//gotEvent = true;
-					}
-				}	
-			}
-#endif
+			poll_and_dispatch_events(ufds, num_pcm_descriptors, &stdin_pollfd, &server_pollfd, &stdin_manager, &socket_manager, &init, handle);
 		}
 		free(buf);
 	}
@@ -2097,7 +2762,8 @@ static int write_and_poll_loop(snd_pcm_t *handle)
 	delete_CommandParser(parser);
 	return 0;
 }
-int do_main(void) {
+#endif
+static int do_main(void) {
 	int n = sd_listen_fds(0);
 	if (n > 1) {
 		fprintf(stderr, "Too many file descriptors received.\n");
@@ -2111,21 +2777,33 @@ int do_main(void) {
 		inputfd = fileno(stdin);
 		outputfd = fileno(stdout);
 	}
-
-	snd_pcm_t *handle;
-	int err;
-	snd_pcm_hw_params_t *hwparams;
-	snd_pcm_sw_params_t *swparams;
+	
+	//TODO: Read these from systemd/other external process, to allow easy switching of server address.
+	int control_server_socket_fd = init_CommandServerSocket();
+	if (control_server_socket_fd < 0) {
+		printf("Couldn't open server socket\n");
+		return -1;
+	}
+	snd_output_t *output = 0;
+	snd_pcm_t *handle = 0;
+	int err = 0;
+	snd_pcm_hw_params_t *hwparams = 0;
+	snd_pcm_sw_params_t *swparams = 0;
 	snd_pcm_hw_params_alloca(&hwparams);
 	snd_pcm_sw_params_alloca(&swparams);
 	err = snd_output_stdio_attach(&output, stdout, 0);
 	if (err < 0) {
+		printf("Couldn't attach pcm to stdout\n");
+		return -1;
+	}
+	/*if (err < 0) {
 		printf("Output failed: %s\n", snd_strerror(err));
 		return 0;
-	}
-	printf("Playback device is %s\n", device);
-	printf("Stream parameters are %iHz, %s, %i channels\n", rate, snd_pcm_format_name(format), channels);
-	if ((err = snd_pcm_open(&handle, device, SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
+	}*/
+	//printf("Playback device is %s\n", device);
+	
+	//printf("Stream parameters are %iHz, %s, %i channels\n", rate, snd_pcm_format_name(format), channels);
+	if ((err = snd_pcm_open(&handle, device, SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK)) < 0) {
 		printf("Playback open error: %s\n", snd_strerror(err));
 		return 0;
 	}
@@ -2138,17 +2816,35 @@ int do_main(void) {
 		printf("Setting of swparams failed: %s\n", snd_strerror(err));
 		exit(EXIT_FAILURE);
 	}
+	
 	//if (verbose > 0)
 		snd_pcm_dump(handle, output);
+	
+	//TODO: Error handling on close. Is it even possible?
 	snd_config_update_free_global();
-	err = write_and_poll_loop(handle);
+	err = write_and_poll_loop_v2(handle, control_server_socket_fd);
 	if (err < 0)
 		printf("Transfer failed: %s\n", snd_strerror(err));
-
+	snd_pcm_hw_free(handle);
 	snd_pcm_close(handle);
-	return 0;
+	while (close(control_server_socket_fd) == -1) {
+		switch (errno) {
+			case EBADFD:
+				assert(false && "control_server_socket_fd must be valid at this point");
+				return -1;
+			case EINTR:
+				continue;
+			case EIO:
+				printf("IO error when closing control_server_socket_fd\n");
+				return -1; //TODO: Figure out how to properly handle this.
+		}
+	}
+	snd_output_close(output);
+	return err;
 }
 int main(void)
 {
-	return do_main();
+	int retv = do_main();
+	printf("Done!\n");
+	return retv;
 }

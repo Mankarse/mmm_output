@@ -1,10 +1,19 @@
 cmake_minimum_required(VERSION 2.8)
 
 project(mmm_output_kdevelop)
-SET (CMAKE_C_COMPILER             "clang-3.5")
-add_compile_options(-std=gnu99)#Need to use gnu C on linux, since some system headers require it to work correctly (e.g. ALSA)
-add_compile_options(-Wall -Wextra -pedantic -Werror)
+SET(CMAKE_C_COMPILER "clang-3.5")
+add_compile_options(-std=c11)
+add_compile_options(-Wall -Wextra -Weverything -Wno-padded -pedantic)#with clang, add --analyze for static analysis.
 
+#See http://clang.llvm.org/docs/UsersManual.html#controlling-code-generation
+#There are mutually incompatible options, chose wisely.
+#Also, some options are incompatible with Valgrind, and some 
+#options require that all referenced libraries also be compiled with that option.
+add_compile_options(-fsanitize=undefined)
+SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=undefined")
+
+add_definitions(-D_POSIX_C_SOURCE=200809L -D_FORTIFY_SOURCE=2) #We need some posix libraries to compile properly on linux. Might not be needed elsewhere.
+#add_compile_options(-Os)
 SET(CMAKE_C_IMPLICIT_INCLUDE_DIRECTORIES "$ENV{HOME}/raspberrypi/rootfs/include")
 
 find_path(ALSA_INCLUDE_DIRS alsa/asoundlib.h DOC "Include for ALSA")
