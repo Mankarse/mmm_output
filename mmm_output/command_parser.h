@@ -29,4 +29,35 @@ int CommandParser_execute(
 );
 
 
+
+//Commands:
+//Tutorial:
+//TODO
+//Overview:
+/*
+typedef enum {
+	UpdatePlaylist,
+	ReplacePlaylist,
+	Pause,
+	Resume,
+	GetCurrentState,
+	Halt,
+} CommandType;
+*/
+//Syntax:
+//
+//Semantics+Responses:
+//UpdatePlaylist,
+//ReplacePlaylist,
+//  TODO
+// GetCurrentState:
+//  TODO
+// Pause/Resume:
+//  Immediately responds with 'pausing' or 'resuming'
+//  Doesn't wait for *actual* pausing/resuming to complete.
+// Halt:
+//  Shuts down mmm_player.
+//  No response.
+
+
 #endif /*MMM_COMMAND_PARSER_H*/

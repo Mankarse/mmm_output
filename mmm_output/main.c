@@ -1,12 +1,12 @@
 #if 1
-//#define _POSIX_C_SOURCE 200809L
 #include "main.h"
 #include "command_parser.h"
 //When compiling with std=c11 on linux,
 //ALSA incorrectly redefined timespec and timeval.
 //These defines stop <time.h> from defining timespec or timeval,
 //and so allow us to use ALSA's definitions
-//ALSA also requires alloca for 
+//ALSA also requires alloca for its in-place
+//allocation macros.
 #include <alloca.h>
 //#define __timespec_defined 1
 #include <alsa/asoundlib.h>
@@ -43,11 +43,11 @@
 
 #include <stdbool.h>
 
-#include <systemd/sd-daemon.h>
+//#include <systemd/sd-daemon.h>
 
 #include <sys/socket.h>
-#include<sys/socket.h>
-#include<arpa/inet.h>	//inet_addr
+#include <sys/socket.h>
+#include <arpa/inet.h>	//inet_addr
 
 static int inputfd = -1;
 static int outputfd = -1;
@@ -70,11 +70,11 @@ static unsigned int rate = 44100;           /* stream rate */
 static unsigned int channels = 2;           /* count of channels */
 //These two parameters affect latency, likelihood of underrun and power usage.
 //Choose wisely.
-static unsigned int buffer_time = 50000;       /* Ring buffer length in us. Determines the latency of the system after data has been transfered. (?)*/
-static unsigned int period_time = 50000;       /* Period time in us. Determines how much data is requested at a time. Capped to approx period_time <= buffer_time/3 (?)*/
+static unsigned int buffer_time = 250000;       /* Ring buffer length in us. Determines the latency of the system after data has been transfered. (?)*/
+static unsigned int period_time = 250000/8;       /* Period time in us. Determines how much data is requested at a time. Capped to approx period_time <= buffer_time/3 (?)*/
 //static int verbose = 0;                 /* verbose flag */
 static unsigned int resample = 1;                /* enable alsa-lib resampling */
-static int period_event = 1;                /* produce poll event after each period */ /*TODO: was 0*/
+static int period_event = 1;                /* produce poll event after each period */ /*TODO: was 0, investigate*/
 static snd_pcm_sframes_t buffer_size; //Number of frames in buffer_time at the given sample rate
 static snd_pcm_sframes_t period_size; //Number of frames in period_time at the given sample rate
 //static snd_output_t *output = NULL;
@@ -98,11 +98,14 @@ static snd_pcm_sframes_t period_size; //Number of frames in period_time at the g
 //The following features are not compatible with all of the above rules:
 // Arbitrary length URL/Tracks
 // Arbitrary length playlist (this is not strictly necessary)
+// Operation on a multi-user, non-real-time operating system.
 // Other stuff idk
 
 //TODO (up next):
+// Fix multi-line command bug (currently all commands are incorrectly assumed to be 1 line long).
 // Seek
 // GetState
+// Investigate why the Boundary ALSA snd_pcm option appears to be not initialised properly.
 // Gap-free track transitions.
 // Delays (and volume and other effects?)
 // Multiple outputs (file/stream/test/DAC) (switched on per-track basis or global basis? (or both))
@@ -149,6 +152,9 @@ static void delete_forwards_TrackPlayIdentifierNode(TrackPlayIdentifierNode *tra
 	}
 }
 
+static bool TrackPlayState_is_null(TrackPlayState const *state) {
+	return state->track == 0;
+}
 
 void free_command(struct Command *command) {
 	if (command) {
@@ -160,6 +166,7 @@ void free_command(struct Command *command) {
 			case Halt:
 			case Pause:
 			case Resume:
+			case GetCurrentState:
 			break;
 			//default:break;
 		}
@@ -172,7 +179,7 @@ typedef struct {
 	struct Command *back;
 } CommandQueue;
 
-static int queue_command(CommandQueue *commandQueue, struct Command* command) {
+static int queue_command(CommandQueue *commandQueue, struct Command *command) {
 	//Adds `command` to the front of the queue;
 	if (!commandQueue->front) {
 		commandQueue->front = command;
@@ -186,7 +193,6 @@ static int queue_command(CommandQueue *commandQueue, struct Command* command) {
 		commandQueue->front = command;
 		command->prev = 0;
 	}
-	//printf("Enqueued command\n");
 	return 0;
 }
 
@@ -279,6 +285,8 @@ typedef struct {
 	//(Contains the reference to the cache, the TrackPlayIdentifier of the track, and
 	//  (implicitly, in the current implementation) the information about how far through the
 	//  track the player currently is.)
+	//If no track is playing, currentTrack is 'nullified'.
+	//This can be detected by calling TrackPlayState_is_null
 	TrackPlayState currentTrack;
 	PauseResumeManager play_resume_manager;
 	PlayerState state;
@@ -323,26 +331,11 @@ static void free_PlaylistPlayer(PlaylistPlayer *player) {
 	//assert(false);
 	destroy_Playlist(&player->playlist);
 	destroy_CacheList(&player->cachelist);
-	destroy_TrackPlayState(&player->currentTrack); 	//TODO? Or these don't actually require any deallocation.
+	destroy_TrackPlayState(&player->currentTrack); //TODO? Or these don't actually require any deallocation.
 	//destroy_PlayResumeManager
 	//destroy_PlayerState
 }
-#if 0
-//typedef struct {} Input;
 
-struct ResumingInput {
-    Input *nextInput;
-};
-struct PausingInput {
-    Input *nextInput;
-};
-struct SilenceInput {
-
-};
-struct PlaylistInput {
-    Playlist *playlist;
-};
-#endif
 //States:
 //Playing Playlist
 //Going to pause from playing
@@ -365,7 +358,8 @@ static bool TrackPlayIdentifier_compatible_with(TrackPlayIdentifier const *l, Tr
 }
 
 static void destroy_FileCache(FileCache *cache) {
-	sf_close(cache->file);
+	int err = sf_close(cache->file);
+	assert(err == 0 && "We have no way to handle sf_close failing.");
 }
 
 void destroy_TrackPlayState(TrackPlayState *state) {
@@ -485,7 +479,7 @@ static size_t PauseResumeManager_do_pause(
 	//  Search for zero crossing
 	//  mute after zero crossing found
 	//  if 0.1 seconds pass with no zero crossing found, spend next 0.1 seconds
-	//  smoothly decreasing volume to 0
+	//  smoothly decreasing volume to 0 (not yet implemented)
 	// (Frames beyond the end of the track are taken to contain silence)
 	// once all channels are muted, the pause is complete, so return.
 
@@ -501,22 +495,17 @@ static size_t PauseResumeManager_do_pause(
 			}
 		}
 		for (int chan = 0; chan != NUM_CHANNELS; ++chan) {
-			if (!pauser->currentTrack->muted[chan]) {
-				if (
-					(pauser->currentTrack->prev_non_negative[chan] && frames[chan] <= 0)
-					||(pauser->currentTrack->prev_non_positive[chan] && frames[chan] >= 0))
-				{
-					pauser->currentTrack->muted[chan] = true;
-					out[pos][chan] = 0;
-				}
-				else {
-					out[pos][chan] = frames[chan];
-				}
-			}
-			else {
+			if ( pauser->currentTrack->muted[chan]
+		      ||(pauser->currentTrack->prev_non_negative[chan] && frames[chan] <= 0)
+			  ||(pauser->currentTrack->prev_non_positive[chan] && frames[chan] >= 0)
+			   )
+			{
+				pauser->currentTrack->muted[chan] = true;
 				out[pos][chan] = 0;
 			}
-			
+			else {
+				out[pos][chan] = frames[chan];
+			}
 		}
 		if (!all(pauser->currentTrack->muted, NUM_CHANNELS)) {
 			for (int chan = 0; chan != NUM_CHANNELS; ++chan) {
@@ -604,9 +593,7 @@ static size_t PauseResumeManager_do_resume(
 
 
 
-static bool TrackPlayState_is_null(TrackPlayState *state) {
-	return state->track == 0;
-}
+
 
 static size_t PlaylistPlayer_do_silence(size_t current_frame, short (* const buf)[NUM_CHANNELS], size_t buf_len)
 {
@@ -997,6 +984,53 @@ void delete_forwards_FileCacheNode(FileCacheNode *file) {
 }
 
 //Takes ownership of all elements of new_playlist. Empties new_playlist.
+
+//Updates or Replaces the player's playlist.
+//A Replace operation is simple: the old playlist is immediatly replaced with the new playlist
+//and so the player goes on to the new items (as soon as it can do a soft-stop/start).
+//An Update operation attempts to change a playlist, but not affect the start of the playlist.
+//This is useful because it allows the future playlist to be changed without interrupting the current
+//track.
+//The concept of the update operation is that the new playlist
+// will start to replace the old playlist at a specific point.
+//The client should choose this point to be the latest common element between the
+// actual playlist and their desired playlist. //This assumption is false in the case of modifying a future track,
+//                                             //if the client wants to just continue on in the case where their modification was
+//                                             //not received in time.
+//Then the old playlist is searched for the first element of the new playlist,
+//and takes the new playlist values from that point onwards.
+//(This searching is done on the basis of GUID only, which allows the matching element
+// to be modified if necessary (for example, to to change its volume, change its start point, end-point, etc).
+//If there is no match, this indicates that the player has already passed the matching point, and so the first element
+// of the new playlist is dropped (it has already played), and the old playlist is replaced with the
+// tail of the new playlist.
+//Problem: //TODO: fix this bug.
+// If the client wishes to modify a future element (e.g., to change it's start/end point)
+//  but their request is delayed until that element has already played, the playing will reset back to the track after the modified track,
+//  rather than simply continuing on from the latest matching element in the new playlist.
+// Maybe the protocol should be changed to allow multiple matching head elements, so that if the first has
+// passed, later ones can still work seamlessly.
+// In this case, the protocol would also require a "matching head length" parameter, so that there would be 
+//  a specific point at which the system would stop attempting to match, and just change to the new playlist.
+
+//replace_playlist == update_playlist with (matching_head_size == 0)!!
+
+
+//Tasks
+// Replace a playlist entirely
+// Skip forwards in a playlist, doing nothing if the skip-to point has already been reached
+// Change the tail of a playlist, seamlessly continuing the playing of the current track(s) (if possible)
+//  skipping back to the element after the change-point if the playing of the change-point has already completed.
+// Modify an element of a playlist, doing nothing if the playing of that element has already completed.
+// Modify multiple elements of a playlist, doing nothing if the playing of that element has already completed.
+
+//Invariants:
+// The eventual result of an operation must be identical regardless of how long its sending gets delayed by
+//  If something was meant to be modified, but it is already in the past, don't go back and change it, just
+//  (counter-factually) assume that the modification did in-fact happen, and carry on.
+
+
+////TODO Complete this description, remove other incorrect comments.
 static void PlaylistPlayer_update_playlist(PlaylistPlayer *player, Playlist *new_playlist, CommandType updateOrReplace) {
 	assert(updateOrReplace == UpdatePlaylist || updateOrReplace == ReplacePlaylist);
 	if (updateOrReplace == ReplacePlaylist) {
@@ -1188,22 +1222,6 @@ struct AudioCallbackData {
 	PlaylistPlayer player;
 	struct Command *halt_command;
 };
-#if 0
-//Returns the first frame in buf
-static sf_count_t find_zero_crossing(int *buf, sf_count_t buf_frames, int channels, int channel, bool prev_positive, bool prev_negative) {
-    for (int i = 0; i < buf_frames; ++i) {
-        int index = i*channels + channel;
-        if ((prev_negative && buf[index] >= 0) || (prev_positive && buf[index] <= 0)) {
-            return i;
-        }
-        prev_positive = buf[index] >= 0;
-        prev_negative = buf[index] <= 0;
-    }
-    return buf_frames;
-}
-#endif
-
-
 
 
 //Need to never make a sudden jump in audio volume.
@@ -1277,10 +1295,9 @@ static void AudioCallback(void *const userdata,
 			command = 0;
 			PlaylistPlayer_pause(&ud->player);
 		}break;
-		//case SeekTrack:
-		//break;
-		//case CetCurrentState:
-		//break;
+		case GetCurrentState:
+			assert(false && "The get_current_state command should have been handled before this point.");
+		break;
 		}
 		free_command(command);
 	}
@@ -1339,7 +1356,7 @@ static void AudioCallback(void *const userdata,
 //   UpdateQueue(List<(syncid, trackid)>)
 //   SeekTrack(syncid, time)
 //   PausePlayback
-//   GetCurrentState -> syncid, trackid, time
+//    -> syncid, trackid, time
 //  Effects Control:
 //   TODO
 //  Output Selection:
@@ -1374,21 +1391,6 @@ void add_track(Playlist *playlist, TrackPlayIdentifierNode *track) {
 		playlist->back = track;
 	}
 }
-
-
-
-#if 0
-struct AudioDeviceManager {
-	Vector<AudioDevice>;
-};
-#endif
-
-#if 0
-staic void file_loader() {
-	//TODO
-
-}
-#endif
 
 static void delete_forwards_Command(struct Command *command) {
 	while (command) {
@@ -1504,55 +1506,6 @@ static void free_command_queue(CommandQueue *commandQueue) {
 //   Same as Internal Programming bug
 //   Add security controls (we probably won't do this, as we don't have any projected threats in the current setup)
 //   Make the API hard to misuse.
-#if 0
-static bool has_terminating_newline(char const *line, size_t len) {
-	return len != 0 && line[len-1] == '\n';
-}
-#endif
-/*
-struct InputCallbackData {
-	struct AudioCallbackData *audioCallback;
-	struct ParseState parseState;
-};*/
-#if 0
-void handle_input(size_t in_line_len, char const *in_line, void *ud) {
-	struct InputCallbackData *data = ud;
-	//getline(&in_line,&in_line_len,stdin);// fgetln(stdin, &in_line_len);//TODO re-add
-	if (has_terminating_newline(in_line, in_line_len)) {
-		--in_line_len;
-	}
-	Command *command = parse_command(in_line, in_line_len);
-	if (!command) {
-		fprintf(stderr, "Invalid command: ");
-		//sizeof(size_t)*CHAR_BIT gives number of bits,
-		//which is strictly less than number of decimal
-		//digits for positive numbers of bits. +4 because of %, s, \n and \0
-		//Strictly speaking this should be ceil(sizeof(size_t)*CHAR_BIT*log_10(2))+4,
-		//but the C preprocesor can't do floating point arithmetic.
-		char format_str[sizeof (size_t) * CHAR_BIT + 4];
-		sprintf(format_str, "%%.%zus\n", in_line_len);
-		fprintf(stderr, format_str, in_line);
-		return;
-		//continue;//TODO re-add
-	}
-	switch (command->type) {
-		#if 0 //TODO
-		case GetCurrentState:
-			PlayState state = get_current_state();
-			char const *state_string = serialise_PlayState(&state);
-			puts(state_string);
-			free(state_string);
-			free_command(command);
-		break;
-		#endif
-		default:
-		if (queue_command(&data->audioCallback->commandQueue, command) != 0) {
-			free_command(command);
-		}
-		break;
-	}
-}
-#endif
 #endif
 
 
@@ -1678,141 +1631,45 @@ static int set_swparams(snd_pcm_t *handle, snd_pcm_sw_params_t *swparams)
 	}
 	return 0;
 }
-#if 0
-/*
- *   Underrun and suspend recovery
- */
-static int xrun_recovery(snd_pcm_t *handle, int err)
-{
-	//if (verbose)
-	//	printf("stream recovery\n");
-	if (err == -EPIPE) {    /* under-run */
-		err = snd_pcm_prepare(handle);
-		if (err < 0) {
-			printf("Can't recovery from underrun, prepare failed: %s\n", snd_strerror(err));
-		}
+
+struct PlayerStateRepresentation {
+	//Playlist
+	//Position in Current Track (Just do this to start with)
+	int currentPositionInTrack; //TODO: Fully specify what this means. To what precision is it measured?
+	                            //How should we handle possible variation in sample rate?
+	int lengthOfTrack;
+	//State/Phase (playing,pausing,etc.)
+	//Everything else (volume, where the output is going, delay etc. (all these are not yet implemented))
+};
+int PlaylistPlayer_get_current_position_in_track(PlaylistPlayer const *playlistPlayer) {
+	if (TrackPlayState_is_null(&playlistPlayer->currentTrack)) {
+		return -1;
+	}
+	else {
+		return sf_seek(playlistPlayer->currentTrack.cache.file, 0, SEEK_CUR);
+	}
+}
+struct PlayerStateRepresentation PlaylistPlayer_get_current_state(PlaylistPlayer const *playlistPlayer) {
+	//TODO: For fully precise currentPosition, we need a reference to the ALSA pcm object.
+	return (struct PlayerStateRepresentation){
+		.currentPositionInTrack = PlaylistPlayer_get_current_position_in_track(playlistPlayer)
+	};
+}
+
+char *serialise_PlaylistPlayer(struct PlayerStateRepresentation *state) {
+	char *buf = malloc(200);
+	if (!buf) return 0;
+	int err = snprintf(buf, 200, "%d\n", state->currentPositionInTrack);
+	if (err > 200 || err < 0) {
+		free(buf);
 		return 0;
-	} else if (err == -ESTRPIPE) { /*Suspended (?)*/
-		while ((err = snd_pcm_resume(handle)) == -EAGAIN)
-			sleep(1);   /* wait until the suspend flag is released *///TODO: Don't block other tasks!!!
-		if (err < 0) {
-			err = snd_pcm_prepare(handle);
-			if (err < 0)
-				printf("Can't recovery from suspend, prepare failed: %s\n", snd_strerror(err));
-		}
-		return 0;
 	}
-	return err;
+	return buf;
 }
-#endif
-#if 0
-struct InputReadData {
-	//void *ud;
-	//command_read_callback command_callback; //= command_was_read
-	struct CommandParser *command_parser;
-};
-static void inputReadCallback(char const *in_buf, size_t in_buf_size, void *ud) {
-	struct InputReadData *userData = ud;
-	if (CommandParser_execute(userData->command_parser, in_buf, in_buf_size/*, userData->command_callback, userData->ud*/) != 0) {
-		assert(false && "Error parsing input");//TODO
-	}
-}
-#endif
-#if 0
-struct StdInManager {
-	void *ud; /*= struct InputReadData {
-		void *ud;
-		command_read_callback command_callback;
-		CommandParser *command_parser;
-	};*/
-	void (*readCallback)(char const *in_buf, size_t in_buf_size, void *ud); //= inputReadCallback
-
-/*
-	void *ud;// = (struct InputCallbackData){.audioCallback = &callbackData};
-	void (*inputCallback)(size_t in_line_size, char const *in_line, void *ud);
-	size_t input_line_capacity;// = 1;
-	size_t input_line_size;// = 0;
-	char *input_line;/// = malloc(input_line_capacity);
-*/
-	int inputfd;
-};
-
-static void StdInManager_read(struct StdInManager *manager) {
-	char input_data[256];
-	ssize_t bytes_read = read(manager->inputfd, input_data, sizeof input_data);
-	if (bytes_read == -1) {
-		printf("Error reading from stdin\n");
-		assert(false && "Error reading from stdin\n");
-		exit(1);//TODO report error to highter layer.
-	}
-	manager->readCallback(input_data, (size_t)bytes_read, manager->ud);
-#if 0
-	if (manager->input_line_capacity == manager->input_line_size) {
-		manager->input_line = realloc(manager->input_line, manager->input_line_capacity*2);
-		if (!manager->input_line) {
-			printf("Couldn't allocate memory for input line");
-			exit(1);
-		}
-		manager->input_line_capacity = manager->input_line_capacity*2;
-	}
-	ssize_t bytes_read = read(manager->inputfd, &manager->input_line[manager->input_line_size], manager->input_line_capacity - manager->input_line_size);
-	if (bytes_read == -1) {
-		printf("Error reading from stdin");
-		exit(1);
-	}
-	bool foundNewLine = false;
-	for (ssize_t i = 0; i < bytes_read; ++i) {
-		if (manager->input_line[manager->input_line_size + i] == '\n') {
-			foundNewLine = true;
-			manager->inputCallback(manager->input_line_size+i, manager->input_line, manager->ud);
-			memcpy(&manager->input_line[0], &manager->input_line[manager->input_line_size + i + 1], bytes_read - i - 1);
-			manager->input_line_size = bytes_read - i - 1;
-			break;
-		}
-	}
-	if (!foundNewLine) {
-		manager->input_line_size += bytes_read;
-	}
-#endif
-}
-#endif
-#if 0
-void StdInManager_init(struct StdInManager *manager, void (*inputCallback)(size_t in_line_size, char const *in_line, void *ud), void *ud) {
-	manager->ud = ud;
-	manager->inputCallback = inputCallback;
-	manager->input_line_capacity = 1;
-	manager->input_line_size = 0;
-	manager->input_line = malloc(manager->input_line_capacity);
-	if (!manager->input_line) {
-		fprintf(stderr, "Couldn't allocate memory for StdInManager\n");
-		exit(-1);
-	}
-	manager->inputfd = inputfd;
-}
-#endif
-#if 0
-static void StdInManager_init(struct StdInManager *manager, void (*readCallback)(char const *in_buf, size_t in_buf_size, void *ud), void *ud) {
-	manager->ud = ud;
-	manager->readCallback = readCallback;
-	manager->inputfd = inputfd;
-}
-
-static void StdInManager_fill_pollfd(struct StdInManager *manager, struct pollfd *ufd) {
-	ufd->fd = manager->inputfd;
-	ufd->events = POLLIN;//= (struct pollfd){.fd = manager->stdinfd, .events = POLLIN, .revents = 0};
-}
-#endif
-#if 0
-struct SocketInManager {
-	void *ud;
-	void (*inputCallback)
-};
-#endif
 struct CommandReadData {
 	struct AudioCallbackData *audioCallback;
-	//OutputBuffer outBuffer;
 };
-static int command_was_read(struct Command *command, void *ud) {
+static int command_was_read(struct Command *command, /*OutputBuffer *outBuffer, */void *ud) {
 	//Push command into command queue
 	//Or error?
 	struct CommandReadData *data = ud;
@@ -1836,21 +1693,32 @@ static int command_was_read(struct Command *command, void *ud) {
 		//exit(-1);
 	}
 	switch (command->type) {
-		#if 0 //TODO
-		case GetCurrentState:
-			PlayState state = get_current_state();
-			char const *state_string = serialise_PlayState(&state);
+		//#if 0 //TODO
+		case GetCurrentState: {
+			//TODO: More finegrained state reading, rather than just 
+			// dumping the entire state in response to every request.
+			struct PlayerStateRepresentation state = PlaylistPlayer_get_current_state(&data->audioCallback->player);
+			//serialise_PlaylistPlayer produces a string representing the subset
+			//of the complete state of the PlaylistPlayer that is useful
+			//for external users. It does not include all necessary information
+			//to reproduce the PlaylistPlayer elsewhere, but rather just
+			//information about the current track, current status, etc.
+			char *state_string = serialise_PlaylistPlayer(&state); //TODO: Streaming interface? Don't put everything into a huge buffer.
 			puts(state_string); //need access to i/o file descriptor.
 			                    //should defer output until it is ready to read.
+			//OutBuffer_queue_response(outBuffer, state_string);
 			free(state_string);
 			free_command(command);
+		}
 		break;
-		#endif
+		//#endif
 		default:
 		if (queue_command(&data->audioCallback->commandQueue, command) != 0) {
 			free_command(command);
+			//OutBuffer_queue_response(outBuffer, strdup("Error Queueing Command"));
 			return -1;
 		}
+		//OutBuffer_queue_response(outBuffer, "got " + command->type);
 		break;
 	}
 	return 0;
@@ -1929,11 +1797,35 @@ struct SocketManager {
 	//HandleConnectionRevent
 };
 
-static int init_CommandServerSocket() {
+static int close_socket_server(int server_socket_fd) {
+	while (close(server_socket_fd) == -1) {
+		switch (errno) {
+			case EBADFD:
+				assert(false && "server_socket_fd must be valid at this point");
+				return -1;
+			case EINTR:
+				continue;
+			case EIO:
+				printf("IO error when closing server_socket_fd\n");
+				return -1; //TODO: Figure out how to properly handle this.
+		}
+	}
+	return 0;
+}
+
+static int init_CommandServerSocket(void) {
 	//Create and Bind socket.
 	//Begin listening later, once we are ready to handle connections.
+	
 	int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (socket_fd < 0) return socket_fd;
+	
+	//TODO: Setting SO_REUSEADDR to simplify debugging (by allowing the server to be restarted without waiting for TIME_WAIT)
+	//      Need to come back and consider whether this is appropriate for a production system.
+	if (setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &(int){ 1 }, sizeof(int)) < 0) {
+		close_socket_server(socket_fd);
+		return -1;
+	}
 	struct sockaddr_in server;
 	server.sin_family = AF_INET;
 	server.sin_addr.s_addr = INADDR_ANY;
@@ -1942,7 +1834,8 @@ static int init_CommandServerSocket() {
 	if(bind(socket_fd, (struct sockaddr*)&server , sizeof(server)) < 0)
 	{
 		//print the error message
-		printf("Couldn't bind CommandServerSocket.");
+		printf("Couldn't bind CommandServerSocket.\n");
+		close_socket_server(socket_fd);
 		return -1;
 	}
 	return socket_fd;
@@ -2023,6 +1916,10 @@ static int SocketManager_handleSocketRevent(struct SocketManager *manager, int r
 		assert(false &&  "input socket got POLLOUT");//TODO: fix error handling.
 		return -1;
 	}
+	if (revents & POLLHUP) {
+		assert(false && "input socket got POLLHUP");//TODO: fix error handling
+		return -1;
+	}
 	if (revents & POLLIN) {
 		int newConnection_fd = accept(manager->socket_fd, 0, 0);
 		if (newConnection_fd < 0) {
@@ -2056,6 +1953,47 @@ static int SocketManager_handleSocketRevent(struct SocketManager *manager, int r
 	}
 	return 0;
 }
+
+void SocketManager_close_connection(struct SocketManager *manager, size_t index) {
+	assert(index < manager->connections_len);
+	assert(manager->connections[index].connection_fd != -1);
+	
+	while (close(manager->connections[index].connection_fd) == -1) {
+		switch (errno) {
+			case EBADFD:
+				assert(false && "Attempting to double-close client connection.");
+				break;
+			case EINTR:
+				continue;
+			case EIO:
+				printf("IO error when closing connection socket\n");
+				break; //TODO: Figure out how to properly handle this.
+		}
+	}
+	delete_CommandParser(manager->connections[index].parser);
+	
+	printf("Closed Connection; fd == %d\n", manager->connections[index].connection_fd);
+	
+	manager->connections[index].connection_fd = -1;
+	manager->connections[index].parser = NULL;
+}
+
+void SocketManager_remove_closed_connections(struct SocketManager *manager) {
+	size_t num_removed = 0;
+	for (size_t i = 0; i < manager->connections_len; ++i) {
+		int fd = manager->connections[i].connection_fd;
+		if (fd == -1) {
+			++num_removed;
+		}
+		else {
+			assert(num_removed <= i);
+			manager->connections[i-num_removed] = manager->connections[i];
+		}
+	}
+	assert(num_removed <= manager->connections_len);
+	manager->connections_len -= num_removed;
+}
+
 //#if 0
 struct pcm_handler_data {
 	snd_pcm_t *pcm_handle;
@@ -2238,7 +2176,8 @@ static int connections_handler(short *revents, size_t num, void *ud) {
 	for (size_t i = 0; i != num; ++i) {
 		if (revents[i] & POLLERR) {
 			//TODO: Close the connection or something?
-			continue;
+			printf("POLLERR received from client socket #%zu fd:%d\n", i, socket_manager->connections[i].connection_fd);
+			assert(false && "POLLERR received. Figure out how to handle this.");
 		}
 		if (revents[i] & POLLIN) {
 			char input_data[256];
@@ -2248,7 +2187,12 @@ static int connections_handler(short *revents, size_t num, void *ud) {
 				//TODO: Close the connection or something?
 				continue;
 			}
-			if (CommandParser_execute(socket_manager->connections[i].parser, input_data, (size_t)bytes_read) < 0) {
+			else if (bytes_read == 0) {
+				//TODO: Close the connection.
+				//Need some way to get the fact that the connection was losed to the outside world.
+				SocketManager_close_connection(socket_manager, i);
+			}
+			else if (CommandParser_execute(socket_manager->connections[i].parser, input_data, (size_t)bytes_read) < 0) {
 				//TODO: Close the connection or something?
 				printf("Command Parser error on connection #%zu\n", i);
 			}
@@ -2258,6 +2202,7 @@ static int connections_handler(short *revents, size_t num, void *ud) {
 			continue;
 		}
 	}
+	SocketManager_remove_closed_connections(socket_manager);
 	return 0;
 #if 0
 	assert(num == 1);
@@ -2285,7 +2230,7 @@ static int socket_handler(short revent, void *ud) {
 
 //#endif
 //#if 0
-static int poll_and_dispatch_events_v2(
+static int poll_and_dispatch_events(
 	int (*pcm_handler)(unsigned short revents, void *ud),
 	void *pcm_handler_ud,
 	int (*connections_handler)(short *revents, size_t num, void *ud),
@@ -2303,7 +2248,7 @@ static int poll_and_dispatch_events_v2(
 	//      Update command_parser to send output to an output buffer
 	//      and send the output when POLLOUT events arrive.
 	
-	//printf("poll_and_dispatch_events_v2\n");
+	//printf("poll_and_dispatch_events\n");
 	int err = 0;
 	/*
 	pollfds = concat(pcm_pollfds, socket_pollfd, connections_pollfds);
@@ -2391,80 +2336,9 @@ static int poll_and_dispatch_events_v2(
 	return err;
 }
 //#endif
-#if 0
-static int poll_and_dispatch_events(
-	struct pollfd *pcm_ufds,
-	int num_pcm_descriptors,
-	struct pollfd *stdin_pollfd,
-	struct pollfd *server_pollfd,
-	struct StdInManager *stdin_manager,
-	struct SocketManager *socket_manager,
-	bool *init,
-	snd_pcm_t *handle)
-{
-	struct pollfd *ufds = malloc((num_pcm_descriptors+2)*sizeof *ufds);
-	if (!ufds) return -1;
-	
-	for (int i = 0; i != num_pcm_descriptors; ++i) {
-		ufds[i] = pcm_ufds[i];
-	}
-	ufds[num_pcm_descriptors+0] = *stdin_pollfd;
-	ufds[num_pcm_descriptors+1] = *server_pollfd;
-	int num_pollfds = num_pcm_descriptors+2;
-	
-	int err = 0;
-	unsigned short revents = 0;
-	bool gotEvent = false;
-	while (!gotEvent) {
-		//TODO: Also wait for SIGTERM, and
-		//cleanly shut down if it is received.
-		poll(ufds, num_pollfds, -1);
-		snd_pcm_poll_descriptors_revents(handle, ufds, num_pcm_descriptors, &revents);
-		if (revents & POLLERR) {
-			err = -EIO;
-			if (snd_pcm_state(handle) == SND_PCM_STATE_XRUN ||
-				snd_pcm_state(handle) == SND_PCM_STATE_SUSPENDED) {
-				err = snd_pcm_state(handle) == SND_PCM_STATE_XRUN ? -EPIPE : -ESTRPIPE;
-				if (xrun_recovery(handle, err) < 0) {
-					printf("Write error: %s\n", snd_strerror(err));
-					exit(EXIT_FAILURE);
-				}
-				*init = true;
-			} else {
-				printf("Wait for poll failed\n");
-				goto end;
-			}
-			gotEvent = true;
-		}
-		if (revents & POLLOUT) {
-			err = 0;
-			gotEvent = true;
-		}
-		if (ufds[num_pcm_descriptors+0].revents & POLLERR) {
-			fprintf(stderr, "Error reading stdin\n");
-			exit(-1);
-		}
-		if (ufds[num_pcm_descriptors+0].revents & POLLIN) {
-			StdInManager_read(stdin_manager);
-			//gotEvent = true;
-		}
-		SocketManager_handleSocketRevent(socket_manager, &ufds[num_pcm_descriptors+1]);
-		/*
-		 * for (int i = 0; i < num_in_connections; ++i) {
-		 *     if(ufds[first_in_connection+i].revents & POLLIN) {
-		 *         Connection_read(&connections[i]);
-		 *     }
-		 * }
-		 * 
-		 */
-	}
-	end:;
-	free(ufds);
-	return err;
-}
-#endif
+
 //#if 0
-static int write_and_poll_loop_v2(snd_pcm_t *pcm_handle, int control_server_socket_fd) {
+static int write_and_poll_loop(snd_pcm_t *pcm_handle, int control_server_socket_fd) {
 	int err = 0;
 	//TODO: Design+Implement error recovery scheme (especially for all the callbacks).
 	//TODO; Perhaps make the halt-command separate? (Rationale:
@@ -2559,7 +2433,7 @@ static int write_and_poll_loop_v2(snd_pcm_t *pcm_handle, int control_server_sock
 			pcm_handler_data.pcm_underrun = false;
 		}
 #if 0
-	static int poll_and_dispatch_events_v2(
+	static int poll_and_dispatch_events(
 		int (*pcm_handler)(unsigned short revents, void *ud),
 		void *pcm_handler_ud,
 		int (*connections_handler)(short *revents, size_t num, void *ud),
@@ -2573,7 +2447,7 @@ static int write_and_poll_loop_v2(snd_pcm_t *pcm_handle, int control_server_sock
 		struct pollfd *socket_pollfd,
 		snd_pcm_t *pcm_handle)
 #endif
-		if (poll_and_dispatch_events_v2(
+		if (poll_and_dispatch_events(
 		    	pcm_handler, &pcm_handler_data,
 		    	connections_handler, &socket_manager,
 		    	socket_handler, &(struct socket_handler_data){.socket_manager = &socket_manager},
@@ -2583,7 +2457,7 @@ static int write_and_poll_loop_v2(snd_pcm_t *pcm_handle, int control_server_sock
 		    	pcm_handle)
 		  < 0)
 		{
-			printf("poll_and_dispatch_events_v2 failed!\n");
+			printf("poll_and_dispatch_events failed!\n");
 			err = -1;
 			goto end_all;
 		}
@@ -2610,161 +2484,10 @@ static int write_and_poll_loop_v2(snd_pcm_t *pcm_handle, int control_server_sock
 	return err;
 }
 //#endif
-#if 0
-static int write_and_poll_loop(snd_pcm_t *handle, int control_server_socket_fd)
-{
-	//TODO: Design+Implement error recovery scheme (especially for all the callbacks).
-	//TODO; Perhaps make the halt-command separate? (Rationale:
-	// - Normal operation shouldn't be able to cause the system to quit, this should be a separate channel.
-	// - When a halt command is received, the system shuts down and everything stops (and in particular, future commands are ignored),
-	//   this is a fundamentally different behaviour from all the other commands).
-	struct AudioCallbackData callbackData;
-	init_command_queue(&callbackData.commandQueue);
-	init_PlaylistPlayer(&callbackData.player);
-	callbackData.halt_command = 0;
-	
-	struct CommandReadData commandReadData = (struct CommandReadData){
-		.audioCallback = &callbackData
-	};
-	
-	struct CommandParser *parser = new_CommandParser(command_was_read, &commandReadData);
-	if (!parser) {
-		printf("Couldn't allocate command parser");//TODO Proper error handling
-		return -1;
-	}
-	
-	//struct InputCallbackData inputCallback = (struct InputCallbackData){.audioCallback = &callbackData};
-	struct InputReadData inputReadData = (struct InputReadData){
-		//.ud = &commandReadData,
-		//.command_callback = command_was_read, //These are internally referenced by the CommandParser,
-		//                                      //so are unneeded for now, but when we support arbitrary numbers of connections
-		//                                      //we will need to *allocate/deallocate* a CommandReadData and CommandParser per connection.
-		.command_parser = parser,
-	};	/*void *ud;
-	command_read_callback command_callback;
-	CommandParser *command_parser;*/
-	//assert(false);//TODO
-	
-	//
-	//Produce fd-readers+parsers for each incoming connection
-	// Read data in via fd-reader (StdInManager)
-	//  Each read produces callback into Parser.
-	//   Each command produces callback into command_read
 
-	//
-	//data {
-	//  Socket data {
-	//    Socket fd
-	//    Connection fd list? (or something like that)
-	//  }
-	//  AudioCommandQueue (Command queue && Halt-command)
-	//  fd_reader_callback (calls parser)
-	//  Array of: (One-per-fd) {
-	//    fd_read_data {
-	//      ParserData
-	//      Command Read callback
-	//      AudioCommandQueue (pointer)
-	//    }
-	//  }
-	//  //TODO: Error data?
-	//}
 
-	//struct InConnectionManager in_connection_manager;
-	//InConnectionManager_init(&in_connection_manager, socketfd);//TODO
-	
-	//int in_connection_poll_descriptors = InConnectionManager_poll_descriptors_count(&in_connection_manager);
-#if 0
-	struct EventManager ev_manager;
-	
-#endif
-	struct SocketManager socket_manager;
-	if (SocketManager_init(&socket_manager, control_server_socket_fd) != 0) {
-		return -1;
-	}
-	
-	struct StdInManager stdin_manager;
-	StdInManager_init(&stdin_manager, &inputReadCallback, &inputReadData);
-
-	struct pollfd *ufds;
-	
-	struct pollfd stdin_pollfd;
-	struct pollfd server_pollfd;
-	
-	signed short *ptr;
-	int err, num_pcm_descriptors, cptr;
-	bool init = false;
-	num_pcm_descriptors = snd_pcm_poll_descriptors_count(handle);
-	printf("Num pcm_descriptors: %d\n", num_pcm_descriptors);
-	if (num_pcm_descriptors <= 0) {
-		printf("Invalid snd_pcm_poll_descriptors_count\n");
-		return num_pcm_descriptors;
-	}
-	//int num_poll_descriptors = num_pcm_descriptors+1; //pcm+socket.
-	                                    //As connections occur on the socket, more
-	                                    //file descriptors will be added to the list.
-	ufds = malloc(sizeof(struct pollfd) * num_pcm_descriptors);
-	if (ufds == NULL) {
-		printf("No enough memory\n");
-		return -ENOMEM;
-	}
-	if ((err = snd_pcm_poll_descriptors(handle, ufds, num_pcm_descriptors)) < 0) {
-		printf("Unable to obtain poll descriptors for playback: %s\n", snd_strerror(err));
-		return err;
-	}
-	StdInManager_fill_pollfd(&stdin_manager, &stdin_pollfd);
-	SocketManager_fill_socket_poll_descriptor(&socket_manager, &server_pollfd);
-#if 0
-	for (int i=0;i!=num_pcm_descriptors;++i) {
-		EventManager_add(ufds[i]);
-	}
-#endif
-	if (SocketManager_start(&socket_manager) != 0) {
-		printf("Couldn't start control server\n");
-		return -1;
-	}
-	init = true;
-	while (!(callbackData.halt_command && callbackData.halt_command->data.done.done)) {
-		if (!init) {
-			poll_and_dispatch_events(ufds, num_pcm_descriptors, &stdin_pollfd, &server_pollfd, &stdin_manager, &socket_manager, &init, handle);
-		}
-		int avail = snd_pcm_avail_update(handle);
-		short * const buf = malloc(avail * channels * snd_pcm_format_physical_width(format)/CHAR_BIT);
-		ptr = buf;
-		AudioCallback(&callbackData, (unsigned char*)ptr, avail * channels * snd_pcm_format_physical_width(format)/CHAR_BIT);
-		//generate_sine(areas, 0, period_size, &phase);
-		//ptr = buf;
-		cptr = avail;
-		while (cptr > 0) {
-			err = snd_pcm_writei(handle, ptr, cptr);
-			if (err < 0) {
-				if (xrun_recovery(handle, err) < 0) {
-					printf("Write error: %s\n", snd_strerror(err));
-					exit(EXIT_FAILURE);
-				}
-				init = true;
-				break;  /* skip one period */
-			}
-			if (snd_pcm_state(handle) == SND_PCM_STATE_RUNNING) init = false;
-			ptr += err * channels;
-			cptr -= err;
-			if (cptr == 0) break;
-			/* it is possible, that the initial buffer cannot store */
-			/* all data from the last period, so wait awhile */
-			//err = wait_for_poll(handle, ufds, num_pcm_descriptors);
-			poll_and_dispatch_events(ufds, num_pcm_descriptors, &stdin_pollfd, &server_pollfd, &stdin_manager, &socket_manager, &init, handle);
-		}
-		free(buf);
-	}
-	free_command_queue(&callbackData.commandQueue);
-	free_PlaylistPlayer(&callbackData.player);
-	free_command(callbackData.halt_command);
-	free(ufds);
-	delete_CommandParser(parser);
-	return 0;
-}
-#endif
 static int do_main(void) {
-	int n = sd_listen_fds(0);
+	/*int n = sd_listen_fds(0);
 	if (n > 1) {
 		fprintf(stderr, "Too many file descriptors received.\n");
 		return 1;
@@ -2773,10 +2496,10 @@ static int do_main(void) {
 		inputfd = SD_LISTEN_FDS_START + 0;
 		outputfd = SD_LISTEN_FDS_START + 0;
 	}
-	else {
+	else {*/
 		inputfd = fileno(stdin);
 		outputfd = fileno(stdout);
-	}
+	//}
 	
 	//TODO: Read these from systemd/other external process, to allow easy switching of server address.
 	int control_server_socket_fd = init_CommandServerSocket();
@@ -2822,23 +2545,11 @@ static int do_main(void) {
 	
 	//TODO: Error handling on close. Is it even possible?
 	snd_config_update_free_global();
-	err = write_and_poll_loop_v2(handle, control_server_socket_fd);
-	if (err < 0)
-		printf("Transfer failed: %s\n", snd_strerror(err));
+	err = write_and_poll_loop(handle, control_server_socket_fd);
+	if (err < 0) printf("write_and_poll_loop failed: %s\n", snd_strerror(err));
 	snd_pcm_hw_free(handle);
 	snd_pcm_close(handle);
-	while (close(control_server_socket_fd) == -1) {
-		switch (errno) {
-			case EBADFD:
-				assert(false && "control_server_socket_fd must be valid at this point");
-				return -1;
-			case EINTR:
-				continue;
-			case EIO:
-				printf("IO error when closing control_server_socket_fd\n");
-				return -1; //TODO: Figure out how to properly handle this.
-		}
-	}
+	close_socket_server(control_server_socket_fd);
 	snd_output_close(output);
 	return err;
 }

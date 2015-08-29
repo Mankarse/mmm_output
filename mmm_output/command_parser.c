@@ -8,63 +8,66 @@
 #define ONE_LINE_PER_COMMAND //This is buggy, since our command format demands multi-line commands to play files with filenames containing newlines.
 #ifdef ONE_LINE_PER_COMMAND
 struct Command *parse_command(char const * const str, size_t const len);
-struct LineManager {
+struct MessageAssembler {
 	void *ud;// = (struct InputCallbackData){.audioCallback = &callbackData};
-	void (*inputCallback)(size_t in_line_size, char const *in_line, void *ud);
-	size_t input_line_capacity;// = 1;
-	size_t input_line_size;// = 0;
-	char *input_line;// = malloc(input_line_capacity);
+	void (*inputCallback)(size_t message_buffer_size, char const *message_buffer, void *ud);
+	size_t message_buffer_capacity;// = 1;
+	size_t message_buffer_size;// = 0;
+	char *message_buffer;// = malloc(message_buffer_capacity);
 };
-static int create_LineManager(struct LineManager *uninitialisedMemory, void (*inputCallback)(size_t in_line_size, char const *in_line, void *ud), void *ud) {
+static int create_MessageAssembler(struct MessageAssembler *uninitialisedMemory, void (*inputCallback)(size_t message_buffer_size, char const *message_buffer, void *ud), void *ud) {
 	uninitialisedMemory->ud = ud;
 	uninitialisedMemory->inputCallback = inputCallback;
 	
-	uninitialisedMemory->input_line_capacity = 1;
-	uninitialisedMemory->input_line_size = 0;
-	uninitialisedMemory->input_line = malloc(uninitialisedMemory->input_line_capacity);
-	if (!uninitialisedMemory->input_line) {
+	uninitialisedMemory->message_buffer_capacity = 1;
+	uninitialisedMemory->message_buffer_size = 0;
+	uninitialisedMemory->message_buffer = malloc(uninitialisedMemory->message_buffer_capacity);
+	if (!uninitialisedMemory->message_buffer) {
 		return -1;
 	}
 	return 0;
 }
 
-static void destroy_LineManager(struct LineManager *lineManager) {
-	free(lineManager->input_line);
+static void destroy_MessageAssembler(struct MessageAssembler *lineManager) {
+	free(lineManager->message_buffer);
 }
 
-static int LineManager_read(struct LineManager *manager, char const *in_data, size_t in_data_size) {
-	while (manager->input_line_capacity < manager->input_line_size + in_data_size) {
-		manager->input_line = realloc(manager->input_line, manager->input_line_capacity*2);
-		if (!manager->input_line) {
+static int MessageAssembler_read(struct MessageAssembler *manager, char const *in_data, size_t in_data_size) {
+	while (manager->message_buffer_capacity < manager->message_buffer_size + in_data_size) {
+		manager->message_buffer = realloc(manager->message_buffer, manager->message_buffer_capacity*2);
+		if (!manager->message_buffer) {
 			printf("Couldn't allocate memory for input line\n");//TODO: remove ad-hoc printf.
 			return -1;
 		}
-		manager->input_line_capacity = manager->input_line_capacity*2;
+		manager->message_buffer_capacity = manager->message_buffer_capacity*2;
 	}
-	memcpy(&manager->input_line[manager->input_line_size], in_data, in_data_size);
-	bool foundNewLine = false;
-	for (size_t i = 0; i < in_data_size; ++i) {
-		if (manager->input_line[manager->input_line_size + i] == '\n') {
-			foundNewLine = true;
-			manager->inputCallback(manager->input_line_size+i, manager->input_line, manager->ud);
-			memcpy(&manager->input_line[0], &manager->input_line[manager->input_line_size + i + 1], in_data_size - i - 1);
-			manager->input_line_size = in_data_size - i - 1;
-			break;
+	memcpy(&manager->message_buffer[manager->message_buffer_size], in_data, in_data_size);
+
+	size_t i = manager->message_buffer_size;
+	size_t remaining_in_data = manager->message_buffer_size + in_data_size;
+	while (i != remaining_in_data) {
+		if (manager->message_buffer[i] == '\0') {
+			manager->inputCallback(i, manager->message_buffer, manager->ud);
+			
+			remaining_in_data -= i+1;
+			memcpy(&manager->message_buffer[0], &manager->message_buffer[i+1], remaining_in_data);
+			i = 0;
+		}
+		else {
+			++i;
 		}
 	}
-	if (!foundNewLine) {
-		manager->input_line_size += in_data_size;
-	}
+	manager->message_buffer_size = remaining_in_data;
 	return 0;
 }
 
 struct CommandParser {
 	command_read_callback cb;
 	void *command_read_ud;
-	struct LineManager inLineManager;
+	struct MessageAssembler inMessageAssembler;
 };
 
-static void eat_line(size_t len, char const *line, void *ud) {
+static void parse_message(size_t len, char const *line, void *ud) {
 	struct CommandParser *parser = ud;
 	struct Command *command = parse_command(line,len);
 	//if (!command) {
@@ -83,8 +86,8 @@ struct CommandParser *new_CommandParser(command_read_callback cb, void *ud) {
 	return command_parser;
 }
 int create_CommandParser(struct CommandParser *uninitialisedMemory, command_read_callback cb, void *ud) {
-	if (create_LineManager(&uninitialisedMemory->inLineManager, eat_line, uninitialisedMemory)) {
-		printf("Couldn't initialise LineManager\n");
+	if (create_MessageAssembler(&uninitialisedMemory->inMessageAssembler, parse_message, uninitialisedMemory)) {
+		printf("Couldn't initialise MessageAssembler\n");
 		return -1;
 	}
 	uninitialisedMemory->cb = cb;
@@ -92,7 +95,7 @@ int create_CommandParser(struct CommandParser *uninitialisedMemory, command_read
 	return 0;
 }
 void destroy_CommandParser(struct CommandParser *commandParser) {
-	destroy_LineManager(&commandParser->inLineManager);
+	destroy_MessageAssembler(&commandParser->inMessageAssembler);
 }
 void delete_CommandParser(struct CommandParser *commandParser) {
 	destroy_CommandParser(commandParser);
@@ -271,13 +274,15 @@ static bool parse_playlist(Playlist *playlist, char const * const str, size_t *p
 }
 
 struct Command *parse_command(char const * const str, size_t const len) {
-	/*char *string = malloc(len+1);
+	fprintf(stderr, "Got Command with len: %zu\n", len);
+	char *string = malloc(len+1);
 	if (string) {
 		memcpy(string,str,len);
 		string[len] = 0;
 		fprintf(stderr,"%s\n",string);
 	}
-	free(string);*/
+	free(string);
+	
 	size_t pos = 0;
 	struct Command *command = malloc(sizeof *command);
 	if (!command) {return 0;}
@@ -299,6 +304,9 @@ struct Command *parse_command(char const * const str, size_t const len) {
 	}
 	else if (len >= 6 && memcmp(str, "resume", 6) == 0) {
 		command->type = Resume;
+	}
+	else if (len >= 17 && memcmp(str, "get_current_state", 17) == 0) {
+		command->type = GetCurrentState;
 	}
 	else if (len >= 15 && memcmp(str, "update_playlist", 15) == 0) {
 		//printf("Updating Playlist\n");
@@ -331,7 +339,7 @@ int CommandParser_execute(
 	struct CommandParser *parser, char const /*restrict*/ *str, size_t len
 	/*, size_t *chars_consumed,command_read_callback cb, void *ud*/ )
 {
-	return LineManager_read(&parser->inLineManager, str, len);
+	return MessageAssembler_read(&parser->inMessageAssembler, str, len);
 }
 
 
@@ -564,4 +572,5 @@ int CommandParser_parse_command(struct CommandParser *parser, char const *const 
 		}
 	}
 }
+
 #endif /*MULTI_LINE_COMMANDS*/

@@ -19,16 +19,16 @@
 #define NUM_CHANNELS 2
 
 typedef enum {
-	UpdatePlaylist,     //TODO
+	UpdatePlaylist,
 	ReplacePlaylist,
-	//Seek,            //TODO
+	//Seek,            //TODO: Don't do via explicit Seek command, just improve update/replace_playlist
 	Pause,
 	Resume,
-	//GetCurrentState, //TODO
-	Halt, //TODO
+	GetCurrentState,
+	Halt,
 	//,
 } CommandType;
-#define NUM_COMMANDS 5
+#define NUM_COMMANDS 6
 
 typedef struct {
 	char *url;

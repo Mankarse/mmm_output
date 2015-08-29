@@ -57,8 +57,8 @@ interface command_interface {
 //Possible solutions:
 // Ride-through the problem, playing silence, and resume after skipping some amount of time
 //      (good for streams, where the stream can be reset;
-//       not so good for files, because the current location in the file will eventually be decoded, skipping will just cause more problem
-//       also good for locally corrupted region of file (which can be skipped, since it cannot be understood).)
+//       not so good for files, because the current location in the file will eventually be decoded, skipping will just cause more problems;
+//       is good however for locally corrupted region of file (which can be skipped, since it cannot be understood).)
 // Ride-through the problem, playing silence, and resume at the point where the silence began
 //      (good for files, not so good for streams, since the source may have moved on).
 // Increase buffer size, add gap between tracks (only works for relatively short tracks, and only for decoding/reading speed problems)
@@ -104,6 +104,12 @@ enum failure_reason {
 	MISSING //Separate category for file closing/network-drive disconnect etc
 };
 
+interface error_region {
+	size_t start;
+	size_t end;
+	failure_reason problem;
+};
+
 interface input_stream {
 	//add buffer-size controls?
 
@@ -117,6 +123,7 @@ interface input_stream {
 	size_t available_frames();
 	//non-blocking request to put buffering of num_samples at the higest set_priority
 	void request_prioity_buffer(size_t num_samples);
+	void set_buffer_water_marks(size_t low_water_mark, size_t high_water_mark);//? redundant with request_prioity_buffer ?
 	//Set overall priority of reading from this stream.
 	//Starts at -1 (will never buffer)
 	//Non-negative values will buffer.
@@ -127,14 +134,19 @@ interface input_stream {
 	//2: Start of next track, next track soon (Will begin buffering of stream sources)
 	//3: Current track. (Will begin buffering of stream sources)
 	void set_buffering_priority(int priority);
+	
+	
 	//buf_len is in number of char, not number of frames.
 	//This needs to be changed to allow for corruption to begin and end before the end of buf.
 	void get_frames(char *buf, size_t buf_len, size_t *bytes_obtained, failure_reason *reason_for_failure);
+	//e.g.
+	void get_frames2(char *buf, size_t buf_len, vector<error_region> *error_regions);
+	void seek(ptrdiff_t num_frames);//explicitly choose what to skip? Or should this be automatic?
 };
 
 interface input_source {
 	input_stream get_input_stream(input_descriptor name);
-	void discard
+	void discard(input_stream);
 };
 
 struct data_format {
@@ -159,8 +171,17 @@ interface output_straw {
 	//The playlist_player just plays files in whatever format they are provided to it in.
 	//Other parts of the code handle decoding and conversion to hardware-compatible formats.
 	void set_callback(void (*new_callback)(data_format format, size_t buf_size, unsigned char *buf, void *ud));
-
+	//How does this handle the upcoming format changing (due to a track change)
+	//between the scheduling of `set_format` and the execution of the next callback?
+	//Should set_format just be called again with the original data_format? If so, in what circumstances
+	//does this cancel the change vs just scheduling a new change?
 	void set_format(data_format format, size_t after_delay/*delay in frames, relative to end of last call to the callback*/);
+};
+
+interface control_interface {
+	//TODO: How to return response to the command?
+	
+	void set_callback(void (*commandcallback)(command const *command));
 };
 
 
